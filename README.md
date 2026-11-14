@@ -1,599 +1,388 @@
 # 企业级 Nginx 源码编译部署脚本
 
-一键从源码编译安装 Nginx，内置供应链校验、证书校验、HTTP/3、WebDAV、Stream SNI 分流、systemd 沙箱、日志轮转与安全卸载。
+单文件、无 env 依赖的一键 Nginx 编译部署脚本。
 
-适用于 Debian 11+ / Debian 13（推荐），也可用于 Ubuntu 22.04+。
-
-- 当前默认版本：Nginx `1.31.8`、OpenSSL `3.5.9`（LTS）、jemalloc `5.4.0`
-- 安装前缀：`/etc/nginx`
-- 默认站点示例：`main.abc.com` / `dav.abc.com` / `api.abc.com` / `tun.abc.com`
-
-> 示例域名 `abc.com`、示例证书路径仅用于文档演示，部署前请替换为你的真实域名和证书路径。
+- 所有配置直接写在脚本顶部，编辑即可
+- 组件版本、SHA256、commit pin 均为显式变量
+- 默认交互安装；自动询问主站域名与证书
+- 单证书：不拷贝证书，所有站点统一引用
+- 默认只启用 main 主站，其他场景提供模板
+- stream SNI 只监听 TCP 443
+- 支持 HTTP/2、HTTP/3、WebDAV、反向代理、安全基线、systemd 沙箱
+- 支持安装前备份、失败回滚、可审计卸载
 
 ## 目录
 
 - [功能特性](#功能特性)
-- [架构说明](#架构说明)
-- [环境要求](#环境要求)
 - [快速开始](#快速开始)
-- [环境变量说明](#环境变量说明)
-- [安装与卸载](#安装与卸载)
-- [部署后验证](#部署后验证)
-- [证书要求](#证书要求)
-- [WebDAV 使用](#webdav-使用)
-- [日志、备份与回滚](#日志备份与回滚)
-- [安全基线](#安全基线)
-- [性能基线](#性能基线)
-- [常见问题](#常见问题)
-- [升级与校验](#升级与校验)
+- [脚本配置](#脚本配置)
+- [交互安装](#交互安装)
+- [无交互安装](#无交互安装)
+- [架构说明](#架构说明)
+- [安装后目录](#安装后目录)
+- [证书说明](#证书说明)
+- [场景模板](#场景模板)
+- [stream SNI 接入](#stream-sni-接入)
+- [HTTP/3 与端口](#http3-与端口)
+- [验证](#验证)
+- [卸载](#卸载)
 - [项目结构](#项目结构)
 - [相关文档](#相关文档)
 
 ## 功能特性
 
-- **源码编译**：Nginx + OpenSSL + jemalloc，支持 CPU 多线程并行编译。
-- **供应链安全**：HTTPS 下载、SHA256 校验、Git commit pin；严格模式下缺值直接拒绝执行。
-- **证书校验**：导入前校验证书可解析、未过期、证书与私钥匹配、SAN/CN 覆盖目标域名。
-- **HTTP/2 + HTTP/3**：TCP 443 走 Stream SNI 分流，UDP 443 直连 QUIC，并下发 `Alt-Svc`（QUIC 端口可通过 `HTTP3_PORT` 调整，或 `HTTP3_ENABLE=0` 关闭）。
-- **Stream SNI 分流**：主站、TUN（Tunnel）、WebDAV/API 共用 443，按 SNI 转发。
-- **真实客户端 IP**：Stream 向下游发送 PROXY protocol，HTTP 层 `real_ip` 还原真实 IP。
-- **WebDAV 防滥用**：读写分层限速、并发限制、`auth_delay`、Fail2Ban 模板。
-- **TLS 强化**：TLS 1.2/1.3、ECDHE、禁用会话票据、禁用 0-RTT、OCSP stapling。
-- **安全响应头**：HSTS、CSP、X-Frame-Options、X-Content-Type-Options、Referrer-Policy、Permissions-Policy。
-- **systemd 沙箱**：`ProtectSystem=strict`、`PrivateTmp`、`NoNewPrivileges`、最小能力集等。
-- **可运维**：安装前备份、失败回滚、logrotate、journald 自动降级、安全卸载。
-- **可卸载**：支持 `--uninstall` 和 `--uninstall --preserve-www`。
-
-## 架构说明
-
-```text
-                         ┌─────────────────────────────────────────────┐
-                         │                  Nginx                      │
-Client                   │                                             │
-  │                      │  stream (TCP 443/2096/2099/8443)           │
-  │  TCP 443  ──────────►│    ssl_preread SNI + PROXY protocol         │
-  │                      │      ├─ main.abc.com ─► 127.0.0.1:1111     │
-  │                      │      ├─ tun.abc.com  ─► 127.0.0.1:9443     │
-  │                      │      └─ dav/api      ─► 127.0.0.1:7443     │
-  │                      │                                              │
-  │  UDP 443  ──────────►│  http/3 (QUIC) 直接终止 TLS（端口可配置）    │
-  │                      │      ├─ main.abc.com                        │
-  │                      │      ├─ dav.abc.com                         │
-  │                      │      ├─ api.abc.com                         │
-  │                      │      └─ tun.abc.com                         │
-                         └─────────────────────────────────────────────┘
-```
-
-- `web_mux`：WebDAV 与 API 共用本地 `127.0.0.1:7443`，由 `server_name` 做 L7 分流。
-- TUN（Tunnel）：`tun.abc.com` 由 Stream 分流到 `127.0.0.1:9443`，提供 `/vless` 反代入口与 `/healthz`。
-- 默认上游：主站 `/ws_endpoint/` → `127.0.0.1:1000`；TUN `/vless` → `VLESS_UPSTREAM`（默认 `http://127.0.0.1:10000`）。
-
-## 环境要求
-
-- Debian 11+ / Debian 13（优先）或 Ubuntu 22.04+
-- root 权限
-- 已解析的域名（主站、WebDAV、API、TUN）
-- 可用的证书与私钥（建议全链证书）
-- 防火墙放行：
-  - TCP `443`、`2096`、`2099`、`8443`
-  - UDP `443`（HTTP/3）
+- **单文件**：不需要 env 文件、不需要额外目录。
+- **显式版本变量**：组件版本与 SHA256 集中在脚本顶部。
+- **源码编译**：Nginx + OpenSSL + jemalloc，自动多线程编译。
+- **供应链校验**：HTTPS、SHA256、Git commit pin。
+- **单证书**：安装时指定一次，所有站点和模板统一引用。
+- **默认交互**：询问主站域名、证书、私钥、80 跳转。
+- **stream SNI**：默认只监听 443，分流到 main 后端。
+- **场景模板**：`ws`、`webdav`、`reverse-proxy`。
+- **安全基线**：TLS 1.2/1.3、ECDHE、HSTS、CSP、OCSP 自动判断。
+- **systemd 沙箱**：最小能力集、`ProtectSystem=strict` 等。
+- **可运维**：备份、回滚、logrotate、journald 自动降级。
+- **可卸载**：`--uninstall`、`--preserve-www`、`--yes`。
 
 ## 快速开始
 
-### 1. 克隆仓库
+### 方式一：下载后执行（推荐）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<your-org>/<your-repo>/main/install_nginx.sh -o /tmp/install_nginx.sh && sudo bash /tmp/install_nginx.sh
+```
+
+> 把 `<your-org>/<your-repo>` 替换为你的 GitHub 组织/仓库。
+
+### 方式二：直接管道执行
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<your-org>/<your-repo>/main/install_nginx.sh | sudo bash
+```
+
+脚本会优先从 `/dev/tty` 读取交互输入，因此管道方式也可以正常提示。
+
+### 方式三：Git 克隆
 
 ```bash
 git clone <repository-url> nginx-deploy
 cd nginx-deploy
+sudo ./install_nginx.sh
 ```
 
-### 2. 生成并修改配置
+## 脚本配置
+
+所有可修改项都在脚本顶部：
 
 ```bash
-cp env.example env
-vim env
+# ---------- 组件版本 ----------
+NGINX_VER="1.31.8"
+OPENSSL_VER="3.5.9"
+JEMALLOC_VER="5.4.0"
+FANCYINDEX_VER="0.6.0"
+DAV_EXT_VER="3.0.0"
+HEADERS_MORE_VER="0.41"
+NGX_BROTLI_REF="v1.0.0rc"
+
+# ---------- 组件校验值 ----------
+NGINX_TARBALL_SHA256="..."
+OPENSSL_TARBALL_SHA256="..."
+JEMALLOC_TARBALL_SHA256="..."
+FANCYINDEX_TARBALL_SHA256="..."
+DAV_EXT_TARBALL_SHA256="..."
+HEADERS_MORE_TARBALL_SHA256="..."
+NGX_BROTLI_COMMIT="..."
+
+# ---------- 部署参数 ----------
+NON_INTERACTIVE="0"
+PRIMARY_DOMAIN=""
+SSL_CERT_PATH=""
+SSL_KEY_PATH=""
+HTTP_REDIRECT="1"
+MAIN_BACKEND_PORT="1111"
+HTTP3_ENABLE="1"
+HTTP3_PORT="443"
+OCSP_STAPLING="auto"
+STRICT_SUPPLYCHAIN="1"
+STRICT_CERT_SAN="1"
+ROLLBACK_ON_ERROR="1"
+CLEAN_BUILD_ARTIFACTS="1"
+ENABLE_FAIL2BAN_TEMPLATE="1"
+F2B_MAXRETRY="6"
+F2B_FINDTIME="10m"
+F2B_BANTIME="12h"
+F2B_IGNOREIP="127.0.0.1/8 ::1"
 ```
 
-至少修改：
+修改版本时，只需编辑版本号和对应 SHA256 / commit pin。
 
-```bash
-STRICT_SUPPLYCHAIN=1
-STRICT_CERT_SAN=1
-
-MAIN_DOMAIN=main.abc.com
-DAV_DOMAIN=dav.abc.com
-API_DOMAIN=api.abc.com
-TUN_DOMAIN=tun.abc.com
-
-MAIN_CERT_SRC=/etc/letsencrypt/live/abc.com/fullchain.pem
-MAIN_KEY_SRC=/etc/letsencrypt/live/abc.com/privkey.pem
-
-NON_INTERACTIVE=1
-```
-
-> `DAV/API/TUN` 证书留空时，默认复用主站证书。请确认主站证书覆盖这些子域（或使用通配符证书），否则 `STRICT_CERT_SAN=1` 会拒绝安装。
->
-> `env` 包含实际域名与证书路径，已加入 `.gitignore`，请不要提交。
-
-### 3. 非交互安装
+## 交互安装
 
 ```bash
 sudo ./install_nginx.sh
 ```
 
-`install_nginx.sh` 会自动加载同目录下的 `env`。
+提示示例：
 
-### 4. 交互安装
-
-```bash
-sudo ./install_nginx.sh --interactive
+```text
+[1/17] 检查系统兼容性
+[成功] 系统兼容性检查通过
+[2/17] 安装编译依赖
+[3/17] 采集主站参数
+  请输入主站域名（例如 main.example.com）:
+  请输入证书路径（fullchain.pem）:
+  请输入私钥路径（privkey.pem）:
+  是否生成 80 → 443 跳转？ [Y/n]
+[4/17] 校验证书
+...
 ```
 
-> 如需使用其他配置文件：
->
-> ```bash
-> sudo ENV_FILE=/path/to/env ./install_nginx.sh
-> ```
+- 交互提示青色；成功绿色；警告黄色；错误红色。
+- `NO_COLOR=1` 可关闭颜色。
 
-## 环境变量说明
+## 无交互安装
 
-完整模板见 [`env.example`](./env.example)，使用前复制为 `env`。
-
-### 供应链与证书
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `STRICT_SUPPLYCHAIN` | `1` | 严格供应链模式，缺少 SHA256/commit 即终止 |
-| `STRICT_CERT_SAN` | `1` | 证书 SAN 未覆盖域名时终止；`0` 仅告警 |
-| `NGINX_TARBALL_SHA256` | 已内置 | Nginx 源码包校验值 |
-| `OPENSSL_TARBALL_SHA256` | 已内置 | OpenSSL 源码包校验值 |
-| `JEMALLOC_TARBALL_SHA256` | 已内置 | jemalloc 源码包校验值 |
-| `FANCYINDEX_TARBALL_SHA256` | 已内置 | ngx-fancyindex 校验值 |
-| `DAV_EXT_TARBALL_SHA256` | 已内置 | nginx-dav-ext 校验值 |
-| `HEADERS_MORE_TARBALL_SHA256` | 已内置 | headers-more 校验值 |
-| `NGX_BROTLI_COMMIT` | 已内置 | ngx_brotli commit pin |
-
-### 部署模式
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `NON_INTERACTIVE` | `1` | `1` 全程无交互；`0` 缺失参数时交互输入 |
-| `ROLLBACK_ON_ERROR` | `1` | 安装失败自动回滚 |
-| `CLEAN_BUILD_ARTIFACTS` | `1` | 安装成功后清理源码与压缩包 |
-
-### 站点与证书
-
-| 变量 | 示例值 | 说明 |
-|---|---|---|
-| `MAIN_DOMAIN` | `main.abc.com` | 主站域名 |
-| `DAV_DOMAIN` | `dav.abc.com` | WebDAV 域名 |
-| `API_DOMAIN` | `api.abc.com` | API 域名 |
-| `TUN_DOMAIN` | `tun.abc.com` | TUN（Tunnel）域名 |
-| `MAIN_CERT_SRC` | `/etc/letsencrypt/live/abc.com/fullchain.pem` | 主站证书 |
-| `MAIN_KEY_SRC` | `/etc/letsencrypt/live/abc.com/privkey.pem` | 主站私钥 |
-| `DAV_CERT_SRC` / `DAV_KEY_SRC` | 空 | WebDAV 证书（可复用主站） |
-| `API_CERT_SRC` / `API_KEY_SRC` | 空 | API 证书（可复用主站） |
-| `TUN_CERT_SRC` / `TUN_KEY_SRC` | 空 | TUN 证书（可复用主站） |
-| `*_REUSE_MAIN_CERT` | `1` | 未显式提供时复用主站证书 |
-| `VLESS_UPSTREAM` | `http://127.0.0.1:10000` | TUN `/vless` 上游地址 |
-
-### HTTP/3 (QUIC)
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `HTTP3_ENABLE` | `1` | `1` 启用 Nginx HTTP/3；`0` 不监听 UDP（适合其他应用占用 443/udp） |
-| `HTTP3_PORT` | `443` | Nginx QUIC 监听端口；443/udp 被占用时可改为 `8443` 等 |
-
-> QUIC 的 SNI 位于加密的 Initial 包中，Nginx 的 `stream ssl_preread` 只支持 TCP，**无法像 TCP 那样按 SNI 复用 UDP 443**。若其他 QUIC 应用必须使用 443/udp，请使用 `HTTP3_ENABLE=0` 关闭 Nginx HTTP/3，或使用 `HTTP3_PORT` 将 Nginx HTTP/3 移到其他 UDP 端口。
-
-### 内部端口与 OCSP
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `MAIN_MUX_PORT` | `1111` | 主站内部监听端口（`127.0.0.1`） |
-| `WEB_MUX_PORT` | `7443` | WebDAV/API 内部监听端口（`127.0.0.1`） |
-| `TUN_MUX_PORT` | `9443` | TUN（Tunnel）内部监听端口（`127.0.0.1`） |
-| `OCSP_STAPLING` | `auto` | `auto`=证书含 OCSP URL 时启用；`on`=强制；`off`=关闭 |
-
-> 如果主机上其他程序占用了 `7443` 等内部端口，可修改 `MAIN_MUX_PORT` / `WEB_MUX_PORT` / `TUN_MUX_PORT`。这些端口仅绑定 `127.0.0.1`。
->
-> 部分 CA（如新版 Let's Encrypt）证书不再包含 OCSP URL，`OCSP_STAPLING=auto` 会自动关闭 stapling，避免 Nginx 启动告警。
-
-### Fail2Ban 模板
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `ENABLE_FAIL2BAN_TEMPLATE` | `1` | 生成 Fail2Ban 模板（不自动安装） |
-| `F2B_MAXRETRY` | `6` | 失败次数阈值 |
-| `F2B_FINDTIME` | `10m` | 统计窗口 |
-| `F2B_BANTIME` | `12h` | 封禁时长 |
-| `F2B_IGNOREIP` | `127.0.0.1/8 ::1` | 白名单 |
-
-### 卸载
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `FORCE_UNINSTALL` | `0` | `1` 跳过二次确认 |
-| `PRESERVE_WWW` | `0` | `1` 卸载时保留 `/var/www` |
-
-## 安装与卸载
-
-### 安装
+直接编辑脚本顶部：
 
 ```bash
-sudo ./install_nginx.sh
+NON_INTERACTIVE="1"
+PRIMARY_DOMAIN="main.example.com"
+SSL_CERT_PATH="/etc/letsencrypt/live/example.com/fullchain.pem"
+SSL_KEY_PATH="/etc/letsencrypt/live/example.com/privkey.pem"
 ```
 
-安装流程：
-
-1. 系统兼容性检查
-2. 安装编译依赖
-3. 端口冲突预检（UDP/HTTP3、TCP/内部端口）
-4. 检查版本时效性
-5. 采集域名与证书参数
-6. 校验证书 SAN、有效期、私钥匹配
-7. 备份已有 Nginx 配置
-8. 下载并校验源码
-9. 编译 jemalloc、OpenSSL、Nginx
-10. 导入证书
-11. 生成 Nginx、Fail2Ban、systemd、logrotate 配置
-12. 安全停止旧 Nginx，配置测试并启动
-13. 清理编译产物
-
-### 卸载
+然后：
 
 ```bash
-# 交互式卸载（需输入确认短语 UNINSTALL NGINX）
-sudo ./install_nginx.sh --uninstall --interactive
+sudo ./install_nginx.sh --non-interactive
+```
 
-# 卸载但保留 /var/www 数据
-sudo ./install_nginx.sh --uninstall --preserve-www --interactive
+## 架构说明
 
-# 非交互强制卸载（谨慎）
+```text
+                         ┌──────────────────────────────────────────────┐
+                         │                   Nginx                      │
+Client                   │                                              │
+  │  TCP 443 ───────────►│  stream: ssl_preread + PROXY protocol        │
+  │                      │      ├─ <主域名> ─► 127.0.0.1:1111 (main)     │
+  │                      │      └─ default  ─► 127.0.0.1:1111 (main)     │
+  │                      │                                              │
+  │  UDP 443 ───────────►│  http/3 (QUIC) 直接终止 TLS（可关闭/改端口）  │
+  │                      │      └─ main 主站                            │
+  │  TCP 80  ───────────►│  301 → HTTPS（可关闭）                        │
+                         └──────────────────────────────────────────────┘
+```
+
+- 默认只有 `main` 主站生效。
+- 其他场景通过模板复制并修改。
+- 证书统一来自 `/etc/nginx/snippets/ssl.conf`。
+
+## 安装后目录
+
+```text
+/etc/nginx/
+├── conf/nginx.conf
+├── conf.d/
+│   ├── main.conf
+│   ├── redirect-http.conf
+│   ├── ws.conf.example
+│   ├── webdav.conf.example
+│   ├── reverse-proxy.conf.example
+│   └── README.md
+├── snippets/
+│   ├── ssl.conf
+│   ├── proxy-common.conf
+│   └── websocket.conf
+├── stream.conf.d/stream_sni.conf
+└── ssl/dhparam.pem
+```
+
+日志：
+
+```text
+/var/log/nginx/main_access.log
+/var/log/nginx/main_error.log
+/var/log/nginx/access.log
+/var/log/nginx/error.log
+/var/log/nginx/stream_sni.log
+```
+
+网站目录：
+
+```text
+/var/www/html
+/var/www/webdav
+```
+
+## 证书说明
+
+- 安装时只询问一次证书和私钥路径。
+- 证书不会拷贝到 `/etc/nginx`。
+- 所有站点与模板统一引用：
+
+```nginx
+include /etc/nginx/snippets/ssl.conf;
+```
+
+- 校验证书可读、未过期、与私钥匹配、SAN 覆盖主站域名。
+- 证书续期后：
+
+```bash
+nginx -t && systemctl reload nginx
+```
+
+- 证书没有 OCSP URL 时，`OCSP_STAPLING=auto` 会自动关闭 stapling。
+
+## 场景模板
+
+| 模板 | 场景 |
+|---|---|
+| `ws.conf.example` | WebSocket / 长连接反向代理 |
+| `webdav.conf.example` | WebDAV |
+| `reverse-proxy.conf.example` | 通用 HTTP 反向代理 |
+
+使用：
+
+```bash
+cp /etc/nginx/conf.d/ws.conf.example /etc/nginx/conf.d/ws.conf
+vim /etc/nginx/conf.d/ws.conf
+```
+
+修改：
+
+1. `server_name`
+2. `listen 127.0.0.1:<内部端口>`
+3. `proxy_pass` 或 `root`
+4. 日志、超时、上传大小等
+
+## stream SNI 接入
+
+复制模板后，在 `/etc/nginx/stream.conf.d/stream_sni.conf` 中增加：
+
+```nginx
+# map 内
+ws.example.com ws_backend;
+
+# upstream 区域
+upstream ws_backend {
+    server 127.0.0.1:12001;
+}
+```
+
+端口必须与模板中的 `listen` 一致。
+
+```bash
+nginx -t && systemctl reload nginx
+```
+
+## HTTP/3 与端口
+
+```bash
+HTTP3_ENABLE="1"
+HTTP3_PORT="443"
+```
+
+- `HTTP3_ENABLE="0"`：不监听 UDP。
+- `HTTP3_PORT="8443"`：QUIC 改用 UDP 8443，`Alt-Svc` 自动跟随。
+- 安装前检查目标 UDP 端口占用。
+- 若其他 QUIC 应用占用 443/udp，可关闭 Nginx HTTP/3 或改用其他端口。
+
+## 验证
+
+```bash
+sudo /etc/nginx/sbin/nginx -t
+sudo systemctl status nginx --no-pager
+/etc/nginx/sbin/nginx -V 2>&1 | head -5
+curl -kI https://main.example.com/healthz
+curl --http3 -sI https://main.example.com/healthz
+sudo tail -n 100 /var/log/nginx/stream_sni.log
+sudo ss -lntup | grep nginx
+```
+
+## 卸载
+
+### 交互卸载
+
+```bash
+sudo ./install_nginx.sh --uninstall
+```
+
+需要输入：
+
+```text
+UNINSTALL NGINX
+```
+
+### 保留网站数据
+
+```bash
+sudo ./install_nginx.sh --uninstall --preserve-www
+```
+
+保留：
+
+- `/var/www/html`
+- `/var/www/webdav`
+
+### 强制卸载
+
+```bash
 sudo ./install_nginx.sh --uninstall --yes
 ```
 
-卸载会删除：
+### curl 卸载
 
-- `/etc/nginx`
+```bash
+curl -fsSL https://raw.githubusercontent.com/<your-org>/<your-repo>/main/install_nginx.sh -o /tmp/install_nginx.sh && sudo bash /tmp/install_nginx.sh --uninstall
+```
+
+或直接管道：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<your-org>/<your-repo>/main/install_nginx.sh | sudo bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/<your-org>/<your-repo>/main/install_nginx.sh | sudo bash -s -- --uninstall --yes
+```
+
+### 卸载会删除
+
+- `/etc/nginx`（配置、模板、二进制）
 - `/etc/systemd/system/nginx.service`
 - `/etc/logrotate.d/nginx`
 - `/var/log/nginx`、`/var/lib/nginx`
-- `/var/www/html`、`/var/www/dav`（`--preserve-www` 时保留）
-- `/usr/local/src` 下本脚本下载的源码与压缩包
+- `/var/www/html`、`/var/www/webdav`（`--preserve-www` 时保留）
+- `/usr/local/src` 下源码与压缩包
 - jemalloc 安装产物
-- Fail2Ban 的 nginx-webdav 模板/规则
+- Fail2Ban 模板/规则
 
-## 部署后验证
+### 卸载不会删除
 
-```bash
-# 服务状态
-sudo systemctl status nginx --no-pager
+- 证书与私钥
+- 其他程序
+- `/var/backups/nginx-install-*` 备份
 
-# 配置检查
-sudo /etc/nginx/sbin/nginx -t -e /var/log/nginx/error.log -c /etc/nginx/conf/nginx.conf
-
-# 版本与 TLS 库（应显示 1.31.8 + OpenSSL 3.5.9）
-/etc/nginx/sbin/nginx -V 2>&1 | head -5
-
-# 健康检查
-curl -kI https://main.abc.com/healthz
-curl -kI https://dav.abc.com/healthz
-curl -kI https://api.abc.com/healthz
-curl -kI https://tun.abc.com/healthz
-curl -kI https://tun.abc.com/vless
-
-# HTTP/3（需 curl 支持 --http3）
-curl --http3 -sI https://main.abc.com/healthz
-
-# OCSP stapling
-echo | openssl s_client -connect main.abc.com:443 -servername main.abc.com -status 2>/dev/null | grep -A2 "OCSP response"
-
-# SNI 分流命中
-sudo tail -n 100 /var/log/nginx/stream_sni.log
-```
-
-`stream_sni.log` 中应能看到：
-
-```text
-sni="main.abc.com" backend="proxy_main"
-sni="tun.abc.com"  backend="proxy_tun"
-sni="dav.abc.com"  backend="proxy_web_mux"
-sni="api.abc.com"  backend="proxy_web_mux"
-```
-
-## 证书要求
-
-- 建议使用全链证书（含中间证书）。
-- 证书必须未过期，且与私钥匹配。
-- 证书 SAN/CN 必须覆盖对应域名，支持通配符（如 `*.abc.com`）。
-- 私钥安装后权限为 `root:root 0600`，证书为 `root:root 0644`。
-- 复用主站证书时，主站证书必须覆盖 `dav/api/tun` 子域。
-- 严格模式由 `STRICT_CERT_SAN=1` 控制；不建议关闭。
-
-## WebDAV 使用
-
-初始化账号：
-
-```bash
-sudo htpasswd -B /etc/nginx/dav.pass.public your_user
-```
-
-默认防护策略：
-
-| 项目 | 值 |
-|---|---|
-| 读请求限速 | `180r/m`，burst `90` |
-| 写方法限速 | `30r/m`，burst `10` |
-| 认证层限速 | `120r/m`，burst `40` |
-| 单 IP 并发连接 | `6` |
-| 认证延迟 | `1200ms` |
-| 单请求体积 | `50G` |
-| 认证文件 | `/etc/nginx/dav.pass.public` |
-
-Fail2Ban 模板生成在：
-
-```text
-/etc/nginx/security/fail2ban/filter.d/nginx-webdav-auth.conf
-/etc/nginx/security/fail2ban/jail.d/nginx-webdav-auth.local
-```
-
-启用方式（脚本不自动安装 Fail2Ban）：
-
-```bash
-sudo apt-get update && sudo apt-get install -y fail2ban
-sudo cp /etc/nginx/security/fail2ban/filter.d/nginx-webdav-auth.conf /etc/fail2ban/filter.d/
-sudo cp /etc/nginx/security/fail2ban/jail.d/nginx-webdav-auth.local /etc/fail2ban/jail.d/
-sudo systemctl restart fail2ban
-sudo fail2ban-client status nginx-webdav-auth
-```
-
-## 日志、备份与回滚
-
-### 日志
-
-| 日志 | 路径 |
-|---|---|
-| 主访问日志 | `/var/log/nginx/access.log` |
-| 主错误日志 | `/var/log/nginx/error.log` |
-| WebDAV 访问日志 | `/var/log/nginx/dav_access.log` |
-| WebDAV 错误日志 | `/var/log/nginx/dav_error.log` |
-| SNI 分流日志 | `/var/log/nginx/stream_sni.log` |
-
-- 存在 `/dev/log` 时同时写入 journald；不存在时自动降级为仅文件日志。
-- 已自动生成 `/etc/logrotate.d/nginx`：按天轮转、保留 14 天、`USR1` 重开。
-
-### 备份
-
-安装前若已存在 Nginx，会备份到：
-
-```text
-/var/backups/nginx-install-<YYYYmmdd-HHMMSS>/
-├── etc-nginx/
-├── nginx.service
-└── logrotate-nginx
-```
-
-### 回滚
-
-- 安装失败且此前存在 Nginx：从备份恢复 `/etc/nginx` 与 systemd 单元。
-- 安装失败且此前不存在 Nginx：清理本次生成的产物。
-- 需要保留现场排障时设置 `ROLLBACK_ON_ERROR=0`。
-
-## 安全基线
-
-- 供应链：HTTPS + SHA256 + commit pin，严格模式缺值即拒绝。
-- 证书：有效期、私钥匹配、SAN/CN 覆盖校验。
-- 传输：TLS 1.2/1.3、仅 ECDHE、禁用会话票据、禁用 0-RTT、OCSP stapling。
-- 响应头：HSTS（不含 preload）、CSP（无 `unsafe-inline`）、X-Frame-Options、nosniff、Referrer-Policy、Permissions-Policy。
-- 访问控制：WebDAV Basic Auth、分层限速、连接限制、`auth_delay`、Fail2Ban 模板。
-- 真实 IP：Stream PROXY protocol + `real_ip_header proxy_protocol`。
-- 进程：systemd 沙箱、最小能力集、pidfile 安全停止。
-- 可审计：文件日志 + journald + logrotate。
-- 变更安全：安装前备份、失败回滚、严格卸载确认。
-
-## 性能基线
-
-- `worker_processes auto` + `worker_rlimit_nofile 65535` + `reuseport`
-- `sendfile` / `tcp_nopush` / `tcp_nodelay`
-- `open_file_cache`（WebDAV 目录关闭以避免元数据过期）
-- `aio threads`（大文件读写）
-- HTTP/2 复用 + `ssl_session_cache`
-- jemalloc 降低内存碎片
-- Stream `proxy_timeout 1h`，避免切断 TUN/WebSocket 长连接
-- WebDAV 读写分层限速，避免同步客户端被误伤
-
-## 常见问题
-
-### 1. 证书 SAN 校验失败
-
-```text
-证书 SAN 未覆盖域名 xxx
-```
-
-处理方式：
-
-- 提供覆盖该域名的证书；
-- 或使用通配符证书；
-- 或在测试环境设置 `STRICT_CERT_SAN=0`（生产不推荐）。
-
-### 2. 严格供应链校验失败
-
-```text
-严格供应链模式已启用，但未提供 xxx 的 SHA256
-```
-
-处理方式：补全 `env` 中的 SHA256 / commit pin，并与版本严格对应。
-
-### 3. HTTP/3 不生效
-
-- 确认防火墙放行 **UDP 443**；
-- 确认客户端支持 HTTP/3（`curl --http3`）；
-- 检查响应头是否包含 `Alt-Svc: h3=":443"`；
-- 若在 CDN/LB 之后，需要该层支持并转发 QUIC。
-
-### 4. WebDAV 频繁 429
-
-调整 `nginx.conf` 中的 `webdav_read` / `webdav_write` / `webdav_auth_limit`，并检查是否多个用户共享同一出口 IP。
-
-### 5. 没有 journald 日志
-
-Debian 13 最小化系统可能没有 `/dev/log`，脚本会自动跳过 syslog 通道，仅保留文件日志。
-
-### 6. SNI 分流不生效
-
-检查 `/var/log/nginx/stream_sni.log` 中的 `sni` 是否为真实域名。如果始终是同一个域名，通常是上游 CDN/代理没有透传原始 SNI。
-
-### 7. `api/dav` 全部落到主站
-
-确认 Stream 配置已加载，并检查 `stream_sni.log` 中的 `backend` 字段是否为 `proxy_web_mux`。
-
-### 8. 编译报错 `-Werror=vla-parameter`
-
-```text
-error: argument 5 of type 'const uint8_t *' ... [-Werror=vla-parameter]
-cc1: all warnings being treated as errors
-```
-
-原因：Nginx 默认开启 `-Werror`，ngx_brotli 内置的 brotli 源码在新版 GCC 下触发 `-Wvla-parameter` 警告（该告警 GCC 11+ 才引入）。
-
-处理：脚本会自动探测编译器；支持时在 `--with-cc-opt` 中加入 `-Wno-error=vla-parameter`。如果使用自定义编译参数，请确保该参数位于 `-Werror` 之后，例如：
-
-```bash
---with-cc-opt="-O3 -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wno-error=vla-parameter"
-```
-
-### 9. `duplicate listen options for 0.0.0.0:443`
-
-```text
-nginx: [emerg] duplicate listen options for 0.0.0.0:443
-```
-
-原因：同一个 `address:port` 上 `reuseport` 只能声明一次。多个站点都写 `listen 443 quic reuseport;` 时会冲突（`reuseport` 会给 listen 打上“显式选项”标记）。
-
-处理：脚本中四个站点的 HTTP/3 监听已改为 `listen 443 quic;`，仅 Stream 的 TCP 监听保留 `reuseport`。自定义配置时，同一端口最多只在一个 server 块里写 `reuseport`。
-
-### 10. 其他应用占用了 443/udp（QUIC）
-
-Nginx 的 `stream ssl_preread` 只支持 TCP，QUIC 的 SNI 又在加密的 Initial 包中，**Nginx 无法像 TCP 那样按 SNI 转发 UDP/QUIC**。可选方案：
-
-1. 其他应用不是 HTTP/3（例如自定义 QUIC/VPN）：为它使用其他 UDP 端口或其他 IP。
-2. 临时关闭 Nginx HTTP/3：
-
-```bash
-# env
-HTTP3_ENABLE=0
-```
-
-3. 把 Nginx HTTP/3 移到其他 UDP 端口（`Alt-Svc` 会自动带上新端口）：
-
-```bash
-# env
-HTTP3_ENABLE=1
-HTTP3_PORT=8443
-```
-
-4. 如果其他应用也是 HTTP/3：让 Nginx 统一终止 QUIC，按 `server_name` 反代到该应用，不要再让该应用监听 443/udp。
-
-> 安装时会用 `ss` 检测 `HTTP3_PORT` 是否已被占用；若冲突会直接提示，而不是等到启动时失败。重装时若旧 Nginx 正在运行，会跳过该检查。
-
-如果需要“同一个 UDP 443 按 SNI 分流多个任意 QUIC 应用”，需要在 Nginx 前面部署 QUIC-aware L4 路由器（解析 Initial 包 SNI 并做连接 ID 亲和），这不是 Nginx 原生能力。
-
-### 11. 启动失败：`bind() to 127.0.0.1:7443 failed`
-
-```text
-nginx: [emerg] bind() to 127.0.0.1:7443 failed (98: Address already in use)
-```
-
-常见原因：
-
-1. 旧 Nginx 正在优雅退出（QUIT），尚未释放端口；
-2. 主机上其他程序占用了 `7443`/`1111`/`9443`。
-
-脚本现在会：
-
-- 启动前先安全停止旧 Nginx，并等待进程退出；
-- 安装前用 `ss` 检查端口；非 Nginx 进程占用时提前报错并打印进程信息。
-
-排查命令：
-
-```bash
-sudo ss -lntp 'sport = :7443'
-sudo lsof -iTCP:7443 -sTCP:LISTEN
-```
-
-如确实被其他程序占用，修改 `env`：
-
-```bash
-MAIN_MUX_PORT=1111
-WEB_MUX_PORT=17443
-TUN_MUX_PORT=19443
-```
-
-### 12. `ssl_stapling ignored, no OCSP responder URL`
-
-这是**告警，不是错误**。部分 CA 的证书不再包含 OCSP URL。
-
-脚本默认 `OCSP_STAPLING=auto`：检测到证书没有 OCSP URL 时自动关闭 stapling，避免该告警。也可以显式设置：
-
-```bash
-OCSP_STAPLING=off
-```
-
-## 升级与校验
-
-### 升级版本
-
-1. 修改 `env` 中的 `NGINX_VER` / `OPENSSL_VER` / `NGX_BROTLI_REF` 等；
-2. 同步更新对应 SHA256 与 commit pin；
-3. 在测试机重新安装并验证；
-4. 确认 `nginx -V` 输出目标版本与 `built with OpenSSL 3.5.x`。
-
-### 静态校验
-
-```bash
-bash -n install_nginx.sh
-shellcheck -S warning install_nginx.sh
-```
-
-### 运行期校验
-
-```bash
-# 监听端口（TCP 443/2096/2099/8443 + UDP ${HTTP3_PORT:-443}）
-sudo ss -lntup | grep nginx
-
-# 版本与编译参数
-/etc/nginx/sbin/nginx -V
-
-# 配置测试
-sudo /etc/nginx/sbin/nginx -t -e /var/log/nginx/error.log -c /etc/nginx/conf/nginx.conf
-```
-
-> HTTP/3 在 Nginx 中仍属实验性功能，建议保持补丁更新，并在升级前做完整回归测试。
+> 如果脚本中 `NON_INTERACTIVE="1"`，交互卸载需要加 `--interactive`，或使用 `--yes`。
 
 ## 项目结构
 
-| 文件 | 说明 |
-|---|---|
-| [`install_nginx.sh`](./install_nginx.sh) | 一键编译、配置、启动、回滚、卸载；自动加载同目录 `env` |
-| [`env.example`](./env.example) | 配置模板，复制为 `env` 后修改 |
-| `env` | 用户实际配置（含域名/证书路径，已被 `.gitignore` 忽略） |
-| [`.gitignore`](./.gitignore) | 忽略本地 `env` 与临时文件 |
-| [`project.md`](./project.md) | 设计目标与安全基线 |
-| [`DEPLOYMENT.md`](./DEPLOYMENT.md) | 完整部署、排障与升级手册 |
-| `README.md` | 项目总览与快速使用 |
+```text
+.
+├── install_nginx.sh    # 单文件安装/卸载脚本（含全部配置与模板）
+├── README.md
+├── DEPLOYMENT.md
+├── project.md
+└── .gitignore
+```
 
 ## 相关文档
 
 - [部署与排障详解](./DEPLOYMENT.md)
 - [设计目标与安全基线](./project.md)
-- [配置模板 env.example](./env.example)
 
 ---
 
-如用于生产环境，请务必：
+生产使用建议：
 
-1. 替换示例域名与证书路径；
-2. 保持 `STRICT_SUPPLYCHAIN=1`、`STRICT_CERT_SAN=1`；
-3. 在测试环境完成一次完整安装与卸载回归；
+1. 使用 fullchain 证书，并确保 SAN 覆盖主站域名；
+2. 保持 `STRICT_SUPPLYCHAIN="1"`、`STRICT_CERT_SAN="1"`；
+3. 在测试环境完成一次安装与卸载回归；
 4. 按需启用 Fail2Ban 并接入日志采集。
