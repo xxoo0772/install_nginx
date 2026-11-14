@@ -186,6 +186,19 @@ sudo ./install_nginx.sh --interactive
 
 > QUIC 的 SNI 位于加密的 Initial 包中，Nginx 的 `stream ssl_preread` 只支持 TCP，**无法像 TCP 那样按 SNI 复用 UDP 443**。若其他 QUIC 应用必须使用 443/udp，请使用 `HTTP3_ENABLE=0` 关闭 Nginx HTTP/3，或使用 `HTTP3_PORT` 将 Nginx HTTP/3 移到其他 UDP 端口。
 
+### 内部端口与 OCSP
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `MAIN_MUX_PORT` | `1111` | 主站内部监听端口（`127.0.0.1`） |
+| `WEB_MUX_PORT` | `7443` | WebDAV/API 内部监听端口（`127.0.0.1`） |
+| `TUN_MUX_PORT` | `9443` | TUN（Tunnel）内部监听端口（`127.0.0.1`） |
+| `OCSP_STAPLING` | `auto` | `auto`=证书含 OCSP URL 时启用；`on`=强制；`off`=关闭 |
+
+> 如果主机上其他程序占用了 `7443` 等内部端口，可修改 `MAIN_MUX_PORT` / `WEB_MUX_PORT` / `TUN_MUX_PORT`。这些端口仅绑定 `127.0.0.1`。
+>
+> 部分 CA（如新版 Let's Encrypt）证书不再包含 OCSP URL，`OCSP_STAPLING=auto` 会自动关闭 stapling，避免 Nginx 启动告警。
+
 ### Fail2Ban 模板
 
 | 变量 | 默认值 | 说明 |
@@ -215,16 +228,17 @@ sudo ./install_nginx.sh
 
 1. 系统兼容性检查
 2. 安装编译依赖
-3. 检查版本时效性
-4. 采集域名与证书参数
-5. 校验证书 SAN、有效期、私钥匹配
-6. 备份已有 Nginx 配置
-7. 下载并校验源码
-8. 编译 jemalloc、OpenSSL、Nginx
-9. 导入证书
-10. 生成 Nginx、Fail2Ban、systemd、logrotate 配置
-11. 配置测试并启动
-12. 清理编译产物
+3. 端口冲突预检（UDP/HTTP3、TCP/内部端口）
+4. 检查版本时效性
+5. 采集域名与证书参数
+6. 校验证书 SAN、有效期、私钥匹配
+7. 备份已有 Nginx 配置
+8. 下载并校验源码
+9. 编译 jemalloc、OpenSSL、Nginx
+10. 导入证书
+11. 生成 Nginx、Fail2Ban、systemd、logrotate 配置
+12. 安全停止旧 Nginx，配置测试并启动
+13. 清理编译产物
 
 ### 卸载
 
@@ -484,6 +498,47 @@ HTTP3_PORT=8443
 > 安装时会用 `ss` 检测 `HTTP3_PORT` 是否已被占用；若冲突会直接提示，而不是等到启动时失败。重装时若旧 Nginx 正在运行，会跳过该检查。
 
 如果需要“同一个 UDP 443 按 SNI 分流多个任意 QUIC 应用”，需要在 Nginx 前面部署 QUIC-aware L4 路由器（解析 Initial 包 SNI 并做连接 ID 亲和），这不是 Nginx 原生能力。
+
+### 11. 启动失败：`bind() to 127.0.0.1:7443 failed`
+
+```text
+nginx: [emerg] bind() to 127.0.0.1:7443 failed (98: Address already in use)
+```
+
+常见原因：
+
+1. 旧 Nginx 正在优雅退出（QUIT），尚未释放端口；
+2. 主机上其他程序占用了 `7443`/`1111`/`9443`。
+
+脚本现在会：
+
+- 启动前先安全停止旧 Nginx，并等待进程退出；
+- 安装前用 `ss` 检查端口；非 Nginx 进程占用时提前报错并打印进程信息。
+
+排查命令：
+
+```bash
+sudo ss -lntp 'sport = :7443'
+sudo lsof -iTCP:7443 -sTCP:LISTEN
+```
+
+如确实被其他程序占用，修改 `env`：
+
+```bash
+MAIN_MUX_PORT=1111
+WEB_MUX_PORT=17443
+TUN_MUX_PORT=19443
+```
+
+### 12. `ssl_stapling ignored, no OCSP responder URL`
+
+这是**告警，不是错误**。部分 CA 的证书不再包含 OCSP URL。
+
+脚本默认 `OCSP_STAPLING=auto`：检测到证书没有 OCSP URL 时自动关闭 stapling，避免该告警。也可以显式设置：
+
+```bash
+OCSP_STAPLING=off
+```
 
 ## 升级与校验
 

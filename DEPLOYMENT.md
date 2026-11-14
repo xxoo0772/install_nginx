@@ -94,6 +94,14 @@ VLESS_UPSTREAM=http://127.0.0.1:10000
 HTTP3_ENABLE=1
 HTTP3_PORT=443
 
+# 内部端口（仅 127.0.0.1；冲突时调整）
+MAIN_MUX_PORT=1111
+WEB_MUX_PORT=7443
+TUN_MUX_PORT=9443
+
+# OCSP stapling：auto/on/off
+OCSP_STAPLING=auto
+
 # 可选：fail2ban 防暴力破解参数
 ENABLE_FAIL2BAN_TEMPLATE=1
 F2B_MAXRETRY=6
@@ -287,6 +295,17 @@ sudo tail -n 200 /var/log/nginx/stream_sni.log
 - 方案 D：其他应用若也是 HTTP/3，交由 Nginx 统一终止 QUIC 并按 `server_name` 反代，不要重复监听 443/udp
 - 如果需要同一 UDP 443 上按 SNI 分流任意 QUIC 应用，需要额外部署 QUIC-aware L4 路由器（解析 Initial 包 SNI + 连接 ID 亲和），非 Nginx 原生能力
 - 安装时会用 `ss` 检测 `HTTP3_PORT` 是否已被占用；冲突会提前报错。重装且旧 Nginx 正在运行时跳过该检查
+
+3.7 启动失败：`bind() to 127.0.0.1:7443 failed`
+- 现象：`nginx: [emerg] bind() to 127.0.0.1:7443 failed (98: Address already in use)`
+- 常见原因：旧 Nginx 优雅退出未完成；或其他程序占用 `7443/1111/9443`
+- 排查：`sudo ss -lntp 'sport = :7443'`、`sudo lsof -iTCP:7443 -sTCP:LISTEN`
+- 处理：脚本已在启动前安全停止旧 Nginx；若仍冲突，调整 `env` 中的 `MAIN_MUX_PORT` / `WEB_MUX_PORT` / `TUN_MUX_PORT`
+
+3.8 告警：`ssl_stapling ignored, no OCSP responder URL`
+- 这是告警，不是启动失败原因
+- 脚本默认 `OCSP_STAPLING=auto`：证书无 OCSP URL 时自动关闭 stapling
+- 也可显式设置 `OCSP_STAPLING=off`
 
 4. Fail2Ban 模板启用（脚本不自动安装 fail2ban）
 ```bash

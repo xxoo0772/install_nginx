@@ -78,6 +78,15 @@ HTTP3_ENABLE="${HTTP3_ENABLE:-1}"
 # Nginx QUIC 监听端口；若 443/udp 被占用，可改为 8443 等并放行防火墙
 HTTP3_PORT="${HTTP3_PORT:-443}"
 
+#================= 内部 Stream/web_mux 端口（可避开主机其他应用） =================
+MAIN_MUX_PORT="${MAIN_MUX_PORT:-1111}"
+WEB_MUX_PORT="${WEB_MUX_PORT:-7443}"
+TUN_MUX_PORT="${TUN_MUX_PORT:-9443}"
+
+#================= OCSP stapling =================
+# auto=证书含 OCSP URL 时启用；on=强制启用；off=关闭
+OCSP_STAPLING="${OCSP_STAPLING:-auto}"
+
 MAIN_CERT_DST=""
 MAIN_KEY_DST=""
 DAV_CERT_DST=""
@@ -259,6 +268,32 @@ validate_http3_or_exit() {
     fi
 }
 
+validate_internal_settings_or_exit() {
+    local name port
+    for name in MAIN_MUX_PORT WEB_MUX_PORT TUN_MUX_PORT; do
+        port="${!name}"
+        if [[ ! "${port}" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+            log_err "${name} 必须是 1-65535，当前: ${port}"
+            exit 1
+        fi
+    done
+    if [[ "${OCSP_STAPLING}" != "auto" && "${OCSP_STAPLING}" != "on" && "${OCSP_STAPLING}" != "off" ]]; then
+        log_err "OCSP_STAPLING 只能是 auto/on/off，当前: ${OCSP_STAPLING}"
+        exit 1
+    fi
+    if [[ "${MAIN_MUX_PORT}" == "${WEB_MUX_PORT}" || "${MAIN_MUX_PORT}" == "${TUN_MUX_PORT}" || "${WEB_MUX_PORT}" == "${TUN_MUX_PORT}" ]]; then
+        log_err "MAIN_MUX_PORT / WEB_MUX_PORT / TUN_MUX_PORT 不能相同"
+        exit 1
+    fi
+    local public_port
+    for public_port in 443 2096 2099 8443; do
+        if [[ "${MAIN_MUX_PORT}" == "${public_port}" || "${WEB_MUX_PORT}" == "${public_port}" || "${TUN_MUX_PORT}" == "${public_port}" ]]; then
+            log_err "内部端口不能与公开监听端口冲突: ${public_port}"
+            exit 1
+        fi
+    done
+}
+
 check_http3_port_available() {
     [[ "${HTTP3_ENABLE}" == "1" ]] || return 0
     command -v ss >/dev/null 2>&1 || return 0
@@ -278,6 +313,44 @@ check_http3_port_available() {
         log_err "处理方式：设置 HTTP3_ENABLE=0（关闭 Nginx HTTP/3），或设置 HTTP3_PORT=<其他 UDP 端口>"
         exit 1
     fi
+}
+
+check_internal_tcp_ports() {
+    command -v ss >/dev/null 2>&1 || return 0
+
+    local entry port label out
+    for entry in "443:HTTPS" "2096:stream" "2099:stream" "8443:stream" \
+                 "${MAIN_MUX_PORT}:main_mux" "${WEB_MUX_PORT}:web_mux" "${TUN_MUX_PORT}:tun_mux"; do
+        port="${entry%%:*}"
+        label="${entry#*:}"
+        out="$(ss -lntp "sport = :${port}" 2>/dev/null | tail -n +2 || true)"
+        [[ -z "${out}" ]] && continue
+        if printf '%s\n' "${out}" | grep -qv 'nginx'; then
+            log_err "TCP/${port} (${label}) 已被非 Nginx 进程占用："
+            printf '%s\n' "${out}" | sed 's/^/[tcp] /' >&2
+            log_err "请释放该端口；内部端口可通过 MAIN_MUX_PORT/WEB_MUX_PORT/TUN_MUX_PORT 调整"
+            exit 1
+        fi
+    done
+    log_info "TCP 端口检查通过（现有 Nginx 占用将在启动前安全停止）"
+}
+
+ensure_ports_free_or_exit() {
+    command -v ss >/dev/null 2>&1 || return 0
+
+    local entry port label out
+    for entry in "443:HTTPS" "2096:stream" "2099:stream" "8443:stream" \
+                 "${MAIN_MUX_PORT}:main_mux" "${WEB_MUX_PORT}:web_mux" "${TUN_MUX_PORT}:tun_mux"; do
+        port="${entry%%:*}"
+        label="${entry#*:}"
+        out="$(ss -lntp "sport = :${port}" 2>/dev/null | tail -n +2 || true)"
+        if [[ -n "${out}" ]]; then
+            log_err "TCP/${port} (${label}) 在停止旧 Nginx 后仍被占用："
+            printf '%s\n' "${out}" | sed 's/^/[tcp] /' >&2
+            log_err "请先停止占用进程；内部端口可通过 MAIN_MUX_PORT/WEB_MUX_PORT/TUN_MUX_PORT 调整"
+            exit 1
+        fi
+    done
 }
 
 require_readable_file_or_exit() {
@@ -408,6 +481,18 @@ validate_cert_material() {
     else
         log_ok "${label}证书校验通过（域名 ${domain}）"
     fi
+}
+
+certs_support_ocsp() {
+    local cert found=0
+    for cert in "${MAIN_CERT_SRC}" "${DAV_CERT_SRC}" "${API_CERT_SRC}" "${TUN_CERT_SRC}"; do
+        [[ -z "${cert}" ]] && continue
+        found=1
+        if ! openssl x509 -in "${cert}" -noout -ocsp_uri 2>/dev/null | grep -q .; then
+            return 1
+        fi
+    done
+    [[ "${found}" == "1" ]]
 }
 
 stop_nginx_safely() {
@@ -938,8 +1023,8 @@ http {
     ssl_session_tickets off;
 
     # OCSP stapling（证书内需含完整中间链；无外网时仅告警不阻断启动）
-    ssl_stapling on;
-    ssl_stapling_verify on;
+    __SSL_STAPLING_LINE__
+    __SSL_STAPLING_VERIFY_LINE__
     resolver 223.5.5.5 1.1.1.1 valid=300s;
     resolver_timeout 5s;
 
@@ -963,9 +1048,9 @@ map $ssl_preread_server_name $backend_name {
     default         proxy_main;
 }
 
-upstream proxy_main { server 127.0.0.1:1111; }
-upstream proxy_tun  { server 127.0.0.1:9443; }
-upstream proxy_web_mux { server 127.0.0.1:7443; }
+upstream proxy_main { server 127.0.0.1:__MAIN_MUX_PORT__; }
+upstream proxy_tun  { server 127.0.0.1:__TUN_MUX_PORT__; }
+upstream proxy_web_mux { server 127.0.0.1:__WEB_MUX_PORT__; }
 
 server {
     listen 443 reuseport;
@@ -989,7 +1074,7 @@ EOF_STREAM
 
     cat > "${NGINX_CONF_DIR}/proxy_site.conf" <<'EOF_PROXY'
 server {
-    listen 127.0.0.1:1111 ssl proxy_protocol;
+    listen 127.0.0.1:__MAIN_MUX_PORT__ ssl proxy_protocol;
     # HTTP/3 直连 UDP 443，与 stream 的 TCP SNI 分流并存
     # HTTP/3 监听（由 HTTP3_ENABLE / HTTP3_PORT 动态生成）
     __HTTP3_LISTEN_V4__
@@ -1047,8 +1132,8 @@ EOF_PROXY
 
     cat > "${NGINX_CONF_DIR}/webdav_drive.conf" <<'EOF_DAV'
 server {
-    # web_mux: API + WebDAV 在同一 7443 端口按 server_name 分流
-    listen 127.0.0.1:7443 ssl proxy_protocol;
+    # web_mux: API + WebDAV 在同一内网端口按 server_name 分流
+    listen 127.0.0.1:__WEB_MUX_PORT__ ssl proxy_protocol;
     # HTTP/3 监听（由 HTTP3_ENABLE / HTTP3_PORT 动态生成）
     __HTTP3_LISTEN_V4__
     __HTTP3_LISTEN_V6__
@@ -1129,7 +1214,7 @@ EOF_DAV
 
     cat > "${NGINX_CONF_DIR}/api_site.conf" <<'EOF_API'
 server {
-    listen 127.0.0.1:7443 ssl proxy_protocol;
+    listen 127.0.0.1:__WEB_MUX_PORT__ ssl proxy_protocol;
     # HTTP/3 监听（由 HTTP3_ENABLE / HTTP3_PORT 动态生成）
     __HTTP3_LISTEN_V4__
     __HTTP3_LISTEN_V6__
@@ -1166,7 +1251,7 @@ EOF_API
 
     cat > "${NGINX_CONF_DIR}/tun_stream_backend.conf" <<'EOF_TUN'
 server {
-    listen 127.0.0.1:9443 ssl proxy_protocol;
+    listen 127.0.0.1:__TUN_MUX_PORT__ ssl proxy_protocol;
     # HTTP/3 监听（由 HTTP3_ENABLE / HTTP3_PORT 动态生成）
     __HTTP3_LISTEN_V4__
     __HTTP3_LISTEN_V6__
@@ -1211,6 +1296,9 @@ EOF_TUN
     local esc_syslog_access esc_syslog_error esc_syslog_dav_access
     local http3_listen_v4="" http3_listen_v6="" alt_svc_line=""
     local esc_http3_v4 esc_http3_v6 esc_alt_svc
+    local esc_main_mux esc_web_mux esc_tun_mux
+    local ssl_stapling_line="" ssl_stapling_verify_line=""
+    local esc_ssl_stapling esc_ssl_stapling_verify
 
     # Debian 13 最小化系统可能没有 rsyslog；仅当 /dev/log 存在时才启用 journald 通道
     if [[ -S /dev/log ]]; then
@@ -1248,6 +1336,30 @@ EOF_TUN
     esc_http3_v4="$(escape_sed_replacement "${http3_listen_v4}")"
     esc_http3_v6="$(escape_sed_replacement "${http3_listen_v6}")"
     esc_alt_svc="$(escape_sed_replacement "${alt_svc_line}")"
+    esc_main_mux="$(escape_sed_replacement "${MAIN_MUX_PORT}")"
+    esc_web_mux="$(escape_sed_replacement "${WEB_MUX_PORT}")"
+    esc_tun_mux="$(escape_sed_replacement "${TUN_MUX_PORT}")"
+
+    local enable_stapling=0
+    if [[ "${OCSP_STAPLING}" == "on" ]]; then
+        enable_stapling=1
+        if ! certs_support_ocsp; then
+            log_warn "OCSP_STAPLING=on 但证书缺少 OCSP URL，Nginx 启动时会出现告警"
+        fi
+    elif [[ "${OCSP_STAPLING}" == "auto" ]] && certs_support_ocsp; then
+        enable_stapling=1
+    else
+        log_info "证书未包含 OCSP URL 或 OCSP_STAPLING=off，已关闭 ssl_stapling"
+    fi
+    if (( enable_stapling == 1 )); then
+        ssl_stapling_line="ssl_stapling on;"
+        ssl_stapling_verify_line="ssl_stapling_verify on;"
+    else
+        ssl_stapling_line="ssl_stapling off;"
+        ssl_stapling_verify_line="ssl_stapling_verify off;"
+    fi
+    esc_ssl_stapling="$(escape_sed_replacement "${ssl_stapling_line}")"
+    esc_ssl_stapling_verify="$(escape_sed_replacement "${ssl_stapling_verify_line}")"
 
     sed -i "s|__MAIN_DOMAIN__|${esc_main_domain}|g; s|__DAV_DOMAIN__|${esc_dav_domain}|g; s|__API_DOMAIN__|${esc_api_domain}|g; s|__TUN_DOMAIN__|${esc_tun_domain}|g" "${NGINX_STREAM_DIR}/stream_sni.conf"
     sed -i "s|__MAIN_DOMAIN__|${esc_main_domain}|g; s|__MAIN_CERT__|${esc_main_cert}|g; s|__MAIN_KEY__|${esc_main_key}|g" "${NGINX_CONF_DIR}/proxy_site.conf"
@@ -1255,12 +1367,17 @@ EOF_TUN
     sed -i "s|__API_DOMAIN__|${esc_api_domain}|g; s|__API_CERT__|${esc_api_cert}|g; s|__API_KEY__|${esc_api_key}|g" "${NGINX_CONF_DIR}/api_site.conf"
     sed -i "s|__TUN_DOMAIN__|${esc_tun_domain}|g; s|__TUN_CERT__|${esc_tun_cert}|g; s|__TUN_KEY__|${esc_tun_key}|g; s|__VLESS_UPSTREAM__|${esc_vless_upstream}|g" "${NGINX_CONF_DIR}/tun_stream_backend.conf"
 
+    sed -i "s|__MAIN_MUX_PORT__|${esc_main_mux}|g" "${NGINX_STREAM_DIR}/stream_sni.conf" "${NGINX_CONF_DIR}/proxy_site.conf"
+    sed -i "s|__WEB_MUX_PORT__|${esc_web_mux}|g" "${NGINX_STREAM_DIR}/stream_sni.conf" "${NGINX_CONF_DIR}/webdav_drive.conf" "${NGINX_CONF_DIR}/api_site.conf"
+    sed -i "s|__TUN_MUX_PORT__|${esc_tun_mux}|g" "${NGINX_STREAM_DIR}/stream_sni.conf" "${NGINX_CONF_DIR}/tun_stream_backend.conf"
+
     sed -i "s|__HTTP3_LISTEN_V4__|${esc_http3_v4}|g; s|__HTTP3_LISTEN_V6__|${esc_http3_v6}|g" \
         "${NGINX_CONF_DIR}/proxy_site.conf" \
         "${NGINX_CONF_DIR}/webdav_drive.conf" \
         "${NGINX_CONF_DIR}/api_site.conf" \
         "${NGINX_CONF_DIR}/tun_stream_backend.conf"
     sed -i "s|__ALT_SVC_HEADER__|${esc_alt_svc}|" "${NGINX_DIR}/conf/nginx.conf"
+    sed -i "s|__SSL_STAPLING_LINE__|${esc_ssl_stapling}|; s|__SSL_STAPLING_VERIFY_LINE__|${esc_ssl_stapling_verify}|" "${NGINX_DIR}/conf/nginx.conf"
 
     sed -i "s|__SYSLOG_ACCESS__|${esc_syslog_access}|; s|__SYSLOG_ERROR__|${esc_syslog_error}|" "${NGINX_DIR}/conf/nginx.conf"
     sed -i "s|__SYSLOG_DAV_ACCESS__|${esc_syslog_dav_access}|" "${NGINX_CONF_DIR}/webdav_drive.conf"
@@ -1531,8 +1648,12 @@ post_check_and_start() {
     fi
 
     ensure_runtime_dirs
+    # 先彻底停止旧实例，避免其优雅退出期间仍占用 7443 等端口导致新进程 bind 失败
+    stop_nginx_safely
+    ensure_ports_free_or_exit
     /etc/nginx/sbin/nginx -t -e /var/log/nginx/error.log -c /etc/nginx/conf/nginx.conf
-    systemctl restart nginx
+    systemctl reset-failed nginx >/dev/null 2>&1 || true
+    systemctl start nginx
     systemctl --no-pager --full status nginx >/dev/null
 
     log_ok "Nginx 已通过配置测试并成功启动"
@@ -1618,7 +1739,9 @@ main() {
     install_dependencies
     require_cmds
     validate_http3_or_exit
+    validate_internal_settings_or_exit
     check_http3_port_available
+    check_internal_tcp_ports
     check_version_currency
     collect_deploy_inputs
     backup_existing_installation

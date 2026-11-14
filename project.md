@@ -110,3 +110,4 @@
 - 2026-11: 配置方式改为模板化：`env.example` 为模板，用户复制为 `env`；脚本自动加载同目录 `env`，新增 `--interactive` 与 `ENV_FILE` 覆盖；`env` 加入 `.gitignore`；支持 `git clone` 后直接 `sudo ./install_nginx.sh`。
 - 2026-11: 修复 HTTP/3 多站点启动失败：同一 `address:port` 上 `reuseport` 只能声明一次，四个站点的 `listen 443 quic` 移除 `reuseport`，仅 Stream TCP 监听保留。
 - 2026-11: 新增 `HTTP3_ENABLE` / `HTTP3_PORT`：443/udp 被其他 QUIC 应用占用时可关闭 Nginx HTTP/3 或改用其他 UDP 端口；文档说明 Nginx 无法对 QUIC 做 SNI 分流。
+- 2026-11: 启动稳定性修复：启动前安全停止旧 Nginx 并等待退出；新增 TCP/UDP 端口冲突预检；内部 `1111/7443/9443` 改为可配置（`MAIN_MUX_PORT`/`WEB_MUX_PORT`/`TUN_MUX_PORT`）；`OCSP_STAPLING=auto` 根据证书是否含 OCSP URL 自动启停 stapling，避免启动告警。
