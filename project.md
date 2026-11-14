@@ -79,6 +79,7 @@
 # 产出文件要求
 - 脚本: `install_nginx.sh`
 - 项目说明: `project.md`
+- 项目总览: `README.md`（GitHub 格式，包含使用方法与文档入口）
 - 部署说明: `DEPLOYMENT.md`（必须包含完整命令示例、交互与非交互用法、常见故障排查）
 - 卸载能力: 脚本必须提供可审计的 `--uninstall` 选项，默认二次确认并输出风险警告
 - 数据保护卸载: 必须支持 `--uninstall --preserve-www`，仅卸载 Nginx 并保留 `/var/www` 数据
