@@ -4,7 +4,7 @@
 
 - 所有配置在脚本顶部
 - 组件版本与 SHA256 为显式变量
-- 默认交互询问主站域名与证书
+- 默认交互先询问基础域名，再输入主站子域名；证书路径按模板自动生成
 - 单证书、不拷贝证书
 - 默认只启用 main 主站
 - stream SNI 只监听 443
@@ -70,12 +70,22 @@ NGX_BROTLI_COMMIT="..."
 
 # ---------- 部署参数 ----------
 NON_INTERACTIVE="0"
+
+# 基础域名 + 主站子域名（主站域名自动拼接为 main.abc.com）
+BASE_DOMAIN=""
+MAIN_SUBDOMAIN="main"
 PRIMARY_DOMAIN=""
+
+# 证书/私钥路径模板：__BASE_DOMAIN__ 会替换为基础域名
+SSL_CERT_PATH_TPL="/etc/letsencrypt/__BASE_DOMAIN__/fullchain.cer"
+SSL_KEY_PATH_TPL="/etc/letsencrypt/__BASE_DOMAIN__/__BASE_DOMAIN__.key"
+# 也可直接填写固定绝对路径（填写后优先使用）
 SSL_CERT_PATH=""
 SSL_KEY_PATH=""
+
 HTTP_REDIRECT="1"
 MAIN_BACKEND_PORT="1111"
-HTTP3_ENABLE="1"
+HTTP3_ENABLE="0"
 HTTP3_PORT="443"
 OCSP_STAPLING="auto"
 STRICT_SUPPLYCHAIN="1"
@@ -93,14 +103,15 @@ F2B_IGNOREIP="127.0.0.1/8 ::1"
 
 ## 4. 部署前准备
 
-1. 主站域名已解析（例如 `main.example.com`）
-2. 证书与私钥（建议 fullchain）
-3. 证书 SAN 覆盖主站域名
-4. 防火墙放行：
+1. 基础域名已解析，例如 `abc.com`
+2. 主站子域名已解析，例如 `main.abc.com`
+3. 证书与私钥（建议 fullchain）
+4. 证书 SAN 覆盖主站域名
+5. 防火墙放行：
    - TCP `443`
    - TCP `80`（如启用 80 跳转）
-   - UDP `443` 或 `HTTP3_PORT`（如启用 HTTP/3）
-5. 确认端口未被其他非 Nginx 程序占用
+   - UDP `443` 或 `HTTP3_PORT`（仅在启用 HTTP/3 时需要）
+6. 确认端口未被其他非 Nginx 程序占用
 
 ## 5. 交互安装
 
@@ -111,12 +122,15 @@ sudo ./install_nginx.sh
 提示：
 
 ```text
-请输入主站域名（例如 main.example.com）:
-请输入证书路径（fullchain.pem）:
-请输入私钥路径（privkey.pem）:
+请输入基础域名（例如 abc.com）: abc.com
+请输入主站子域名（例如 main，最终为 main.abc.com；输入 @ 使用 abc.com）: main
+请输入证书路径（回车使用默认值）: /etc/letsencrypt/abc.com/fullchain.cer
+请输入私钥路径（回车使用默认值）: /etc/letsencrypt/abc.com/abc.com.key
 是否生成 80 → 443 跳转？ [Y/n]
 ```
 
+- 先输入基础域名，再输入主站子域名，无需输入完整主站域名。
+- 证书路径根据模板自动生成，直接回车即可。
 - 交互提示青色，成功绿色，警告黄色，错误红色。
 - `NO_COLOR=1` 可关闭颜色。
 
@@ -126,9 +140,21 @@ sudo ./install_nginx.sh
 
 ```bash
 NON_INTERACTIVE="1"
-PRIMARY_DOMAIN="main.example.com"
-SSL_CERT_PATH="/etc/letsencrypt/live/example.com/fullchain.pem"
-SSL_KEY_PATH="/etc/letsencrypt/live/example.com/privkey.pem"
+BASE_DOMAIN="abc.com"
+MAIN_SUBDOMAIN="main"
+# 留空时按模板自动生成证书路径
+SSL_CERT_PATH=""
+SSL_KEY_PATH=""
+```
+
+或手动指定证书：
+
+```bash
+NON_INTERACTIVE="1"
+BASE_DOMAIN="abc.com"
+MAIN_SUBDOMAIN="main"
+SSL_CERT_PATH="/etc/letsencrypt/live/abc.com/fullchain.pem"
+SSL_KEY_PATH="/etc/letsencrypt/live/abc.com/privkey.pem"
 ```
 
 执行：
@@ -140,6 +166,18 @@ sudo ./install_nginx.sh --non-interactive
 ## 7. 证书说明
 
 安装时只使用一张证书，不拷贝证书。
+
+证书路径支持模板替换：
+
+- `__BASE_DOMAIN__`：基础域名，例如 `abc.com`
+- `__PRIMARY_DOMAIN__`：主站完整域名，例如 `main.abc.com`
+
+默认模板：
+
+```bash
+SSL_CERT_PATH_TPL="/etc/letsencrypt/__BASE_DOMAIN__/fullchain.cer"
+SSL_KEY_PATH_TPL="/etc/letsencrypt/__BASE_DOMAIN__/__BASE_DOMAIN__.key"
+```
 
 生成：
 
@@ -255,12 +293,13 @@ tail -n 100 /var/log/nginx/stream_sni.log
 ## 11. HTTP/3
 
 ```bash
-HTTP3_ENABLE="1"
+HTTP3_ENABLE="0"
 HTTP3_PORT="443"
 ```
 
-- `0`：不监听 UDP
-- `8443`：QUIC 改用 UDP 8443，`Alt-Svc` 自动跟随
+- 默认关闭，不监听 UDP，避免与其他服务抢占 UDP/443
+- `HTTP3_ENABLE="1"`：启用 QUIC，额外监听 UDP
+- `HTTP3_PORT="8443"`：QUIC 改用 UDP 8443，`Alt-Svc` 自动跟随
 - 安装前检查 UDP 端口占用
 - 其他 QUIC 应用占用 443/udp 时，可关闭 Nginx HTTP/3 或改端口
 
@@ -291,8 +330,8 @@ HTTP_REDIRECT="0"
 sudo /etc/nginx/sbin/nginx -t
 sudo systemctl status nginx --no-pager
 /etc/nginx/sbin/nginx -V 2>&1 | head -5
-curl -kI https://main.example.com/healthz
-curl --http3 -sI https://main.example.com/healthz
+curl -kI https://main.abc.com/healthz
+curl --http3 -sI https://main.abc.com/healthz
 sudo ss -lntup | grep nginx
 ```
 

@@ -3,10 +3,11 @@
 #====================================================
 # 企业级 Nginx 源码编译部署脚本
 # - 单文件、无 env 依赖
-# - 单证书、不拷贝证书
-# - stream SNI 只监听 443，默认只启用 main 主站
+# - 单证书、不拷贝证书；证书路径支持按域名模板自动替换
+# - stream SNI 只监听 TCP 443，默认只启用 main 主站
+# - HTTP/3 默认关闭，避免与其他服务抢占 UDP/443
 # - 场景模板安装到 conf.d/*.conf.example
-# - 默认交互；直接编辑下方配置块即可覆盖版本与参数
+# - 默认交互：先询问基础域名，再输入主站子域名
 #====================================================
 
 set -Eeuo pipefail
@@ -42,18 +43,50 @@ HEADERS_MORE_TARBALL_SHA256="800eba641c29b89dfd00a97ccac314a2b7768bdd85ea37ed819
 NGX_BROTLI_COMMIT="25f86f0bac1101b6512135eac5f93c49c63609e3"
 
 # ---------- 部署参数 ----------
-# 0=交互（推荐）；1=无交互（需填写 PRIMARY_DOMAIN/SSL_CERT_PATH/SSL_KEY_PATH）
+# 0=交互（推荐）；1=无交互（需填写 BASE_DOMAIN 或完整 PRIMARY_DOMAIN + 证书路径）
 NON_INTERACTIVE="0"
-# 留空则交互询问
+
+# 基础域名（根域名）：例如 abc.com
+# 交互模式下会首先询问该项；主站域名将自动由“主站子域名 + 基础域名”拼接而成
+BASE_DOMAIN=""
+
+# 主站子域名：例如 main → main.abc.com
+# 留空或填写 @ 表示直接使用基础域名 abc.com
+MAIN_SUBDOMAIN="main"
+
+# 主站完整域名：一般无需填写
+# 留空时自动按「MAIN_SUBDOMAIN.BASE_DOMAIN」生成；填写后以填写值为准
 PRIMARY_DOMAIN=""
+
+# ---------- 证书路径模板（推荐） ----------
+# 默认证书/私钥路径模板：安装时自动替换以下占位符，无需手工输入完整路径：
+#   __BASE_DOMAIN__     → 基础域名，例如 abc.com
+#   __PRIMARY_DOMAIN__  → 主站完整域名，例如 main.abc.com
+#
+# 默认模板示例（基础域名 abc.com 时）：
+#   证书 → /etc/letsencrypt/abc.com/fullchain.cer
+#   私钥 → /etc/letsencrypt/abc.com/abc.com.key
+#
+# 如使用 certbot 默认目录，可改成：
+#   SSL_CERT_PATH_TPL="/etc/letsencrypt/live/__BASE_DOMAIN__/fullchain.pem"
+#   SSL_KEY_PATH_TPL="/etc/letsencrypt/live/__BASE_DOMAIN__/privkey.pem"
+SSL_CERT_PATH_TPL="/etc/letsencrypt/__BASE_DOMAIN__/fullchain.cer"
+SSL_KEY_PATH_TPL="/etc/letsencrypt/__BASE_DOMAIN__/__BASE_DOMAIN__.key"
+
+# 最终证书/私钥路径：留空则使用上面的模板自动生成
+# 如需手动指定某个固定文件，直接填写绝对路径即可（填写后优先使用填写值）
 SSL_CERT_PATH=""
 SSL_KEY_PATH=""
+
 # 1=生成 80 → 443 跳转
 HTTP_REDIRECT="1"
-# main 站点内部监听端口
+# main 站点内部监听端口（仅本机回环，不可使用 80/443）
 MAIN_BACKEND_PORT="1111"
-# HTTP/3
-HTTP3_ENABLE="1"
+
+# HTTP/3：默认关闭，避免与其他服务抢占 UDP/443
+# 0=关闭（推荐，仅使用 TCP 443 + HTTP/2）
+# 1=启用（会额外监听 UDP 443；如冲突请修改 HTTP3_PORT）
+HTTP3_ENABLE="0"
 HTTP3_PORT="443"
 # OCSP：auto/on/off
 OCSP_STAPLING="auto"
@@ -96,11 +129,24 @@ CC_WARN_OPT=""
 THREADS="$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)"
 
 #================= 渲染占位符 =================
+# 这些变量会在 prepare_config_values() 中根据部署参数生成，
+# 再通过 apply_placeholders() 替换到生成的 Nginx 配置模板中。
+# 这样同一份模板既能带中文注释，又能按需开关 HTTP/3、OCSP 等功能。
+#
+# HTTP/3 监听行：启用时形如 "listen 443 quic;"，关闭时为空字符串（不渲染）
 HTTP3_LISTEN_V4=""
 HTTP3_LISTEN_V6=""
+# HTTP/3 相关指令：启用时输出 http3/quic_retry，关闭时为空
+HTTP3_ON_LINE=""
+QUIC_RETRY_LINE=""
+# HTTP/3 启用状态说明：作为中文注释渲染到主站配置中
+HTTP3_COMMENT_LINE="# HTTP/3 未启用（默认），不监听 UDP，避免与其他 QUIC 服务抢占端口"
+# Alt-Svc 响应头：启用 HTTP/3 时告知浏览器可使用 h3 协议访问
 ALT_SVC_LINE=""
+# OCSP Stapling 指令行：根据证书是否携带 OCSP URL 自动生成 on/off
 SSL_STAPLING_LINE="ssl_stapling off;"
 SSL_STAPLING_VERIFY_LINE="ssl_stapling_verify off;"
+# journald 日志行：系统存在 /dev/log 时才生成，否则为空
 SYSLOG_ACCESS_LINE=""
 SYSLOG_ERROR_LINE=""
 
@@ -222,8 +268,8 @@ parse_args() {
             --help|-h)
                 cat <<'EOF_HELP'
 Usage:
-  install_nginx.sh                     # 交互安装
-  install_nginx.sh --non-interactive   # 无交互安装（需在脚本顶部填写域名/证书）
+  install_nginx.sh                     # 交互安装（先输入基础域名，再输入主站子域名）
+  install_nginx.sh --non-interactive   # 无交互安装（需在脚本顶部填写 BASE_DOMAIN/证书模板）
   install_nginx.sh --uninstall         # 卸载（交互确认）
   install_nginx.sh --uninstall --yes   # 强制卸载
   install_nginx.sh --uninstall --preserve-www
@@ -258,6 +304,59 @@ validate_domain_or_exit() {
     local label="$2"
     if [[ ! "${v}" =~ ^[A-Za-z0-9.-]+$ ]]; then
         ui_err "${label} 格式不合法: ${v}"
+        exit 1
+    fi
+}
+
+# 展开证书路径模板：
+#   __BASE_DOMAIN__    → 基础域名（abc.com）
+#   __PRIMARY_DOMAIN__ → 主站完整域名（main.abc.com）
+expand_path_template() {
+    local template="$1"
+    template="${template//__BASE_DOMAIN__/${BASE_DOMAIN}}"
+    template="${template//__PRIMARY_DOMAIN__/${PRIMARY_DOMAIN}}"
+    printf '%s' "${template}"
+}
+
+# 如果用户只提供了完整主站域名，则从第一个标签后推导基础域名：
+#   main.abc.com → abc.com
+derive_base_domain_from_primary() {
+    if [[ -z "${BASE_DOMAIN}" && -n "${PRIMARY_DOMAIN}" && "${PRIMARY_DOMAIN}" == *.* ]]; then
+        BASE_DOMAIN="${PRIMARY_DOMAIN#*.}"
+        ui_info "未填写基础域名，已根据主站域名推导为: ${BASE_DOMAIN}"
+    fi
+}
+
+# 根据基础域名/主站子域名拼接主站完整域名
+build_primary_domain() {
+    local sub="${MAIN_SUBDOMAIN:-main}"
+
+    if [[ -z "${sub}" || "${sub}" == "@" ]]; then
+        PRIMARY_DOMAIN="${BASE_DOMAIN}"
+        return
+    fi
+
+    if [[ "${sub}" == "${BASE_DOMAIN}" || "${sub}" == *".${BASE_DOMAIN}" ]]; then
+        PRIMARY_DOMAIN="${sub}"
+    else
+        PRIMARY_DOMAIN="${sub}.${BASE_DOMAIN}"
+    fi
+}
+
+# 按模板生成证书/私钥路径；若用户已显式填写则优先使用填写值
+resolve_cert_paths_from_template() {
+    if [[ -z "${SSL_CERT_PATH}" && -n "${SSL_CERT_PATH_TPL}" ]]; then
+        SSL_CERT_PATH="$(expand_path_template "${SSL_CERT_PATH_TPL}")"
+    fi
+    if [[ -z "${SSL_KEY_PATH}" && -n "${SSL_KEY_PATH_TPL}" ]]; then
+        SSL_KEY_PATH="$(expand_path_template "${SSL_KEY_PATH_TPL}")"
+    fi
+
+    if [[ "${SSL_CERT_PATH}" == *"__BASE_DOMAIN__"* \
+        || "${SSL_CERT_PATH}" == *"__PRIMARY_DOMAIN__"* \
+        || "${SSL_KEY_PATH}" == *"__BASE_DOMAIN__"* \
+        || "${SSL_KEY_PATH}" == *"__PRIMARY_DOMAIN__"* ]]; then
+        ui_err "证书路径模板中存在无法替换的占位符，请填写 BASE_DOMAIN 或直接指定证书绝对路径"
         exit 1
     fi
 }
@@ -529,84 +628,103 @@ certs_support_ocsp() {
 }
 
 collect_main_inputs() {
-    ui_step "采集主站参数"
+    ui_step "采集域名与证书参数"
     require_interactive_tty
 
     local value=""
-    if [[ -z "${PRIMARY_DOMAIN}" ]]; then
+
+    # 1) 首先询问基础域名（根域名）
+    while [[ -z "${BASE_DOMAIN}" ]]; do
         if [[ "${NON_INTERACTIVE}" == "1" ]]; then
-            ui_err "NON_INTERACTIVE=1 但未提供 PRIMARY_DOMAIN"
+            derive_base_domain_from_primary
+            [[ -n "${BASE_DOMAIN}" ]] && break
+            ui_err "NON_INTERACTIVE=1 但未提供 BASE_DOMAIN（也无法从 PRIMARY_DOMAIN 推导）"
             exit 1
         fi
-        while true; do
-            value="$(prompt_value "请输入主站域名（例如 main.example.com）")"
-            if [[ -z "${value}" ]]; then
-                ui_warn "域名不能为空"
-                continue
-            fi
-            if [[ ! "${value}" =~ ^[A-Za-z0-9.-]+$ ]]; then
-                ui_warn "域名格式不合法"
-                continue
-            fi
-            PRIMARY_DOMAIN="${value}"
-            break
-        done
+        value="$(prompt_value "请输入基础域名（例如 abc.com）")"
+        if [[ -z "${value}" ]]; then
+            ui_warn "基础域名不能为空"
+            continue
+        fi
+        if [[ ! "${value}" =~ ^[A-Za-z0-9.-]+$ ]]; then
+            ui_warn "域名格式不合法"
+            continue
+        fi
+        BASE_DOMAIN="${value}"
+    done
+    validate_domain_or_exit "${BASE_DOMAIN}" "基础域名"
+
+    # 2) 主站只需输入子域名，脚本自动拼接为「子域名.基础域名」
+    if [[ -z "${PRIMARY_DOMAIN}" ]]; then
+        if [[ "${NON_INTERACTIVE}" != "1" ]]; then
+            value="$(prompt_value "请输入主站子域名（例如 main，最终为 main.${BASE_DOMAIN}；输入 @ 使用 ${BASE_DOMAIN}）" "${MAIN_SUBDOMAIN:-main}")"
+            MAIN_SUBDOMAIN="${value:-${MAIN_SUBDOMAIN:-main}}"
+        fi
+        [[ -z "${MAIN_SUBDOMAIN}" ]] && MAIN_SUBDOMAIN="main"
+        build_primary_domain
+        ui_info "主站域名: ${PRIMARY_DOMAIN}"
     fi
     validate_domain_or_exit "${PRIMARY_DOMAIN}" "主站域名"
 
-    if [[ -z "${SSL_CERT_PATH}" && "${NON_INTERACTIVE}" == "1" ]]; then
-        ui_err "NON_INTERACTIVE=1 但未提供 SSL_CERT_PATH"
-        exit 1
-    fi
-    while true; do
-        if [[ -z "${SSL_CERT_PATH}" ]]; then
-            SSL_CERT_PATH="$(prompt_value "请输入证书路径（fullchain.pem）")"
-        fi
-        if [[ -z "${SSL_CERT_PATH}" ]]; then
-            ui_warn "证书路径不能为空"
-            continue
-        fi
-        if [[ "${SSL_CERT_PATH}" != /* ]]; then
-            ui_warn "请使用绝对路径"
-            SSL_CERT_PATH=""
-            [[ "${NON_INTERACTIVE}" == "1" ]] && { ui_err "证书路径必须是绝对路径"; exit 1; }
-            continue
-        fi
-        if [[ ! -r "${SSL_CERT_PATH}" ]]; then
-            ui_warn "证书不可读: ${SSL_CERT_PATH}"
-            SSL_CERT_PATH=""
-            [[ "${NON_INTERACTIVE}" == "1" ]] && { ui_err "证书不可读"; exit 1; }
-            continue
-        fi
-        break
-    done
+    # 3) 证书路径：优先使用脚本顶部模板自动生成，用户可直接回车采用默认值
+    resolve_cert_paths_from_template
 
-    if [[ -z "${SSL_KEY_PATH}" && "${NON_INTERACTIVE}" == "1" ]]; then
-        ui_err "NON_INTERACTIVE=1 但未提供 SSL_KEY_PATH"
-        exit 1
+    local cert_default="${SSL_CERT_PATH:-}"
+    local key_default="${SSL_KEY_PATH:-}"
+
+    if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+        if [[ -z "${SSL_CERT_PATH}" ]]; then
+            ui_err "NON_INTERACTIVE=1 但未提供 SSL_CERT_PATH 或可用模板 SSL_CERT_PATH_TPL"
+            exit 1
+        fi
+    else
+        while true; do
+            value="$(prompt_value "请输入证书路径（回车使用默认值）" "${cert_default}")"
+            if [[ -z "${value}" ]]; then
+                ui_warn "证书路径不能为空"
+                continue
+            fi
+            if [[ "${value}" != /* ]]; then
+                ui_warn "请使用绝对路径"
+                cert_default="${value}"
+                continue
+            fi
+            if [[ ! -r "${value}" ]]; then
+                ui_warn "证书不可读: ${value}"
+                cert_default="${value}"
+                continue
+            fi
+            SSL_CERT_PATH="${value}"
+            break
+        done
     fi
-    while true; do
+
+    if [[ "${NON_INTERACTIVE}" == "1" ]]; then
         if [[ -z "${SSL_KEY_PATH}" ]]; then
-            SSL_KEY_PATH="$(prompt_value "请输入私钥路径（privkey.pem）")"
+            ui_err "NON_INTERACTIVE=1 但未提供 SSL_KEY_PATH 或可用模板 SSL_KEY_PATH_TPL"
+            exit 1
         fi
-        if [[ -z "${SSL_KEY_PATH}" ]]; then
-            ui_warn "私钥路径不能为空"
-            continue
-        fi
-        if [[ "${SSL_KEY_PATH}" != /* ]]; then
-            ui_warn "请使用绝对路径"
-            SSL_KEY_PATH=""
-            [[ "${NON_INTERACTIVE}" == "1" ]] && { ui_err "私钥路径必须是绝对路径"; exit 1; }
-            continue
-        fi
-        if [[ ! -r "${SSL_KEY_PATH}" ]]; then
-            ui_warn "私钥不可读: ${SSL_KEY_PATH}"
-            SSL_KEY_PATH=""
-            [[ "${NON_INTERACTIVE}" == "1" ]] && { ui_err "私钥不可读"; exit 1; }
-            continue
-        fi
-        break
-    done
+    else
+        while true; do
+            value="$(prompt_value "请输入私钥路径（回车使用默认值）" "${key_default}")"
+            if [[ -z "${value}" ]]; then
+                ui_warn "私钥路径不能为空"
+                continue
+            fi
+            if [[ "${value}" != /* ]]; then
+                ui_warn "请使用绝对路径"
+                key_default="${value}"
+                continue
+            fi
+            if [[ ! -r "${value}" ]]; then
+                ui_warn "私钥不可读: ${value}"
+                key_default="${value}"
+                continue
+            fi
+            SSL_KEY_PATH="${value}"
+            break
+        done
+    fi
 
     ui_step "校验证书"
     validate_cert_material "${SSL_CERT_PATH}" "${SSL_KEY_PATH}" "${PRIMARY_DOMAIN}"
@@ -835,11 +953,17 @@ generate_dhparam() {
 prepare_config_values() {
     HTTP3_LISTEN_V4=""
     HTTP3_LISTEN_V6=""
+    HTTP3_ON_LINE=""
+    QUIC_RETRY_LINE=""
     ALT_SVC_LINE=""
+    HTTP3_COMMENT_LINE="# HTTP/3 未启用（默认），不监听 UDP，避免与其他 QUIC 服务抢占端口"
     if [[ "${HTTP3_ENABLE}" == "1" ]]; then
         HTTP3_LISTEN_V4="listen ${HTTP3_PORT} quic;"
         HTTP3_LISTEN_V6="listen [::]:${HTTP3_PORT} quic;"
+        HTTP3_ON_LINE="http3 on;"
+        QUIC_RETRY_LINE="quic_retry on;"
         ALT_SVC_LINE="add_header Alt-Svc 'h3=\":${HTTP3_PORT}\"; ma=86400' always;"
+        HTTP3_COMMENT_LINE="# HTTP/3 已启用：额外监听 UDP/${HTTP3_PORT}，浏览器可通过 QUIC 访问"
     fi
 
     local stapling=0
@@ -873,7 +997,7 @@ prepare_config_values() {
 
 apply_placeholders() {
     local file="$1"
-    local esc_pd esc_mp esc_cert esc_key esc_v4 esc_v6 esc_alt esc_stap esc_stapv esc_sysa esc_syse
+    local esc_pd esc_mp esc_cert esc_key esc_v4 esc_v6 esc_h3 esc_qr esc_h3c esc_alt esc_stap esc_stapv esc_sysa esc_syse
 
     esc_pd="$(escape_sed_replacement "${PRIMARY_DOMAIN}")"
     esc_mp="$(escape_sed_replacement "${MAIN_BACKEND_PORT}")"
@@ -881,6 +1005,9 @@ apply_placeholders() {
     esc_key="$(escape_sed_replacement "${SSL_KEY_PATH}")"
     esc_v4="$(escape_sed_replacement "${HTTP3_LISTEN_V4}")"
     esc_v6="$(escape_sed_replacement "${HTTP3_LISTEN_V6}")"
+    esc_h3="$(escape_sed_replacement "${HTTP3_ON_LINE}")"
+    esc_qr="$(escape_sed_replacement "${QUIC_RETRY_LINE}")"
+    esc_h3c="$(escape_sed_replacement "${HTTP3_COMMENT_LINE}")"
     esc_alt="$(escape_sed_replacement "${ALT_SVC_LINE}")"
     esc_stap="$(escape_sed_replacement "${SSL_STAPLING_LINE}")"
     esc_stapv="$(escape_sed_replacement "${SSL_STAPLING_VERIFY_LINE}")"
@@ -894,6 +1021,9 @@ apply_placeholders() {
         -e "s|__SSL_KEY_PATH__|${esc_key}|g" \
         -e "s|__HTTP3_LISTEN_V4__|${esc_v4}|g" \
         -e "s|__HTTP3_LISTEN_V6__|${esc_v6}|g" \
+        -e "s|__HTTP3_ON_LINE__|${esc_h3}|g" \
+        -e "s|__QUIC_RETRY_LINE__|${esc_qr}|g" \
+        -e "s|__HTTP3_COMMENT_LINE__|${esc_h3c}|g" \
         -e "s|__ALT_SVC_HEADER__|${esc_alt}|g" \
         -e "s|__SSL_STAPLING_LINE__|${esc_stap}|g" \
         -e "s|__SSL_STAPLING_VERIFY_LINE__|${esc_stapv}|g" \
@@ -906,66 +1036,122 @@ apply_placeholders() {
 write_global_config() {
     ui_step "生成全局配置"
     cat > "${NGINX_DIR}/conf/nginx.conf" <<'EOF_NGINX'
+# ============================================================
+# Nginx 全局配置（由 install_nginx.sh 自动生成）
+#
+# 阅读提示：
+#   1. 以 # 开头的行为中文注释，不影响运行；
+#   2. 安装时占位符会被替换为实际值；
+#   3. 修改配置后请执行：nginx -t && systemctl reload nginx
+# ============================================================
+
+# 运行 Nginx worker 的系统用户/用户组
 user www-data;
+
+# worker 进程数：auto 表示按 CPU 核心数自动设置
 worker_processes auto;
+
+# 每个 worker 可打开的最大文件描述符数量
 worker_rlimit_nofile 65535;
+
+# 主进程 PID 文件位置，systemd 依赖该文件
 pid /run/nginx.pid;
 
+# ============================================================
+# 事件模型：控制连接处理能力
+# ============================================================
 events {
+    # 单个 worker 允许的最大并发连接数
     worker_connections 4096;
+
+    # 尽可能多地接受新连接
     multi_accept on;
 }
 
+# ============================================================
+# stream 四层代理：TCP 443 按 SNI 分流到不同后端
+# - 仅监听 TCP 443，不占用 UDP
+# - 具体域名映射见 /etc/nginx/stream.conf.d/stream_sni.conf
+# ============================================================
 stream {
+    # 记录 SNI、后端名称、流量等字段，便于排障
     log_format stream_sni '$remote_addr:$remote_port -> $server_addr:$server_port '
                           'sni="$ssl_preread_server_name" backend="$backend_name" '
                           'status=$status bytes_in=$bytes_received bytes_out=$bytes_sent';
+
+    # SNI 分流访问日志
     access_log /var/log/nginx/stream_sni.log stream_sni;
+
+    # 引入所有 SNI 分流规则
     include /etc/nginx/stream.conf.d/*.conf;
 }
 
+# ============================================================
+# HTTP/HTTPS 主配置
+# ============================================================
 http {
+    # MIME 类型映射与默认类型
     include       mime.types;
     default_type  application/octet-stream;
 
+    # ---------- 真实客户端 IP ----------
+    # stream 层已开启 proxy_protocol，这里从 PROXY 协议头还原客户端 IP
     real_ip_header proxy_protocol;
     set_real_ip_from 127.0.0.1;
     set_real_ip_from ::1;
     real_ip_recursive on;
 
+    # ---------- 日志 ----------
+    # 文件日志
     access_log /var/log/nginx/access.log;
+    # journald 日志（仅当系统存在 /dev/log 时生成，否则为空行）
     __SYSLOG_ACCESS__
     error_log  /var/log/nginx/error.log warn;
     __SYSLOG_ERROR__
 
+    # ---------- 文件传输优化 ----------
     sendfile        on;
     tcp_nopush      on;
     tcp_nodelay     on;
+
+    # 隐藏响应头中的 Nginx 版本号
     server_tokens   off;
 
+    # ---------- 打开文件缓存 ----------
+    # 减少频繁 stat/open 文件带来的磁盘开销
     open_file_cache max=10000 inactive=30s;
     open_file_cache_valid 30s;
     open_file_cache_min_uses 2;
     open_file_cache_errors on;
 
+    # 使用线程池处理异步文件 I/O
     aio threads;
 
+    # ---------- 临时目录 ----------
+    # 大请求体、代理等场景的临时文件位置
     client_body_temp_path /var/lib/nginx/client_temp;
     proxy_temp_path       /var/lib/nginx/proxy_temp;
     fastcgi_temp_path     /var/lib/nginx/fastcgi_temp;
     uwsgi_temp_path       /var/lib/nginx/uwsgi_temp;
     scgi_temp_path        /var/lib/nginx/scgi_temp;
 
+    # ---------- 缓冲区与超时 ----------
+    # 请求体/请求头缓冲区大小
     client_body_buffer_size      16k;
     client_header_buffer_size    1k;
     large_client_header_buffers  4 8k;
+    # 各类超时时间，防止慢连接长期占用资源
     client_body_timeout          12s;
     client_header_timeout        12s;
     keepalive_timeout            65s;
     send_timeout                 10s;
 
+    # ---------- 限流/限连区域 ----------
+    # 普通请求限速：每 IP 每秒 10 个请求
     limit_req_zone $binary_remote_addr zone=one:10m rate=10r/s;
+    # WebDAV 读取限速
     limit_req_zone $binary_remote_addr zone=webdav_read:10m rate=180r/m;
+    # 仅对 WebDAV 写方法按 IP 限速
     map $request_method $webdav_write_key {
         default   "";
         PUT       $binary_remote_addr;
@@ -978,38 +1164,66 @@ http {
         PROPPATCH $binary_remote_addr;
     }
     limit_req_zone $webdav_write_key zone=webdav_write:10m rate=30r/m;
+    # WebDAV 认证失败限速
     limit_req_zone $binary_remote_addr zone=webdav_auth_limit:20m rate=120r/m;
+    # 每 IP 并发连接数限制
     limit_conn_zone $binary_remote_addr zone=conn_per_ip:10m;
+    # WebDAV 文件锁区域
     dav_ext_lock_zone zone=webdav:10m;
+    # 触发限流/限连时返回 429
     limit_req_status 429;
     limit_conn_status 429;
 
+    # ---------- 基础安全响应头 ----------
+    # 防止点击劫持
     add_header X-Frame-Options "SAMEORIGIN" always;
+    # 禁止浏览器猜测 MIME 类型
     add_header X-Content-Type-Options "nosniff" always;
+    # 限制 Referer 泄露
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    # 强制 HTTPS（按需调整 max-age 或去掉 includeSubDomains）
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    # 关闭不必要的浏览器权限
     add_header Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=()" always;
+    # 内容安全策略，可按站点实际资源来源调整
     add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self';" always;
+
+    # ---------- HTTP/3 Alt-Svc 响应头 ----------
+    # 仅在 HTTP3_ENABLE=1 时生成；用于告知浏览器可改用 h3 协议访问
     __ALT_SVC_HEADER__
 
+    # ---------- TLS 基础参数 ----------
+    # 仅启用 TLS 1.2 / TLS 1.3
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers on;
+    # 推荐的高强度加密套件
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    # DH 参数文件（安装时自动生成）
     ssl_dhparam /etc/nginx/ssl/dhparam.pem;
+    # TLS 会话缓存，减少重复握手开销
     ssl_session_cache shared:SSL:50m;
     ssl_session_timeout 1d;
+    # 关闭会话票据，降低前向安全性风险
     ssl_session_tickets off;
 
+    # ---------- OCSP Stapling ----------
+    # 证书带 OCSP URL 时自动开启，否则自动关闭（见安装脚本逻辑）
     __SSL_STAPLING_LINE__
     __SSL_STAPLING_VERIFY_LINE__
+    # 用于解析 OCSP 服务器域名
     resolver 223.5.5.5 1.1.1.1 valid=300s;
     resolver_timeout 5s;
 
+    # ---------- Brotli 压缩 ----------
+    # 动态压缩开关与压缩级别
     brotli on;
     brotli_comp_level 6;
+    # 若存在预压缩的 .br 文件则优先直接返回
     brotli_static on;
     brotli_types application/javascript application/json application/xml text/css text/plain;
 
+    # ---------- 站点配置 ----------
+    # main.conf、redirect-http.conf 及用户新增站点均放在 conf.d 下
     include /etc/nginx/conf.d/*.conf;
 }
 EOF_NGINX
@@ -1021,22 +1235,45 @@ write_snippets() {
     install -d -m 0755 -o root -g root "${NGINX_SNIPPET_DIR}"
 
     cat > "${NGINX_SNIPPET_DIR}/ssl.conf" <<'EOF_SSL'
-# 统一证书配置（由 install_nginx.sh 生成）
-# 证书不会拷贝到 /etc/nginx，直接引用安装时指定的路径
+# ============================================================
+# 统一证书配置（由 install_nginx.sh 自动生成）
+#
+# 说明：
+#   - 证书不会拷贝到 /etc/nginx，直接引用安装时指定的原始路径
+#   - 所有站点、模板统一通过 include 本文件复用同一张证书
+#   - 证书续期后只需 systemctl reload nginx，无需改动站点配置
+# ============================================================
+
+# 服务器证书（建议使用 fullchain 完整证书链）
 ssl_certificate         __SSL_CERT_PATH__;
+
+# 证书对应的私钥
 ssl_certificate_key     __SSL_KEY_PATH__;
+
+# 受信任证书链，用于 OCSP Stapling 校验
 ssl_trusted_certificate __SSL_CERT_PATH__;
 EOF_SSL
     apply_placeholders "${NGINX_SNIPPET_DIR}/ssl.conf"
     chmod 640 "${NGINX_SNIPPET_DIR}/ssl.conf"
 
     cat > "${NGINX_SNIPPET_DIR}/proxy-common.conf" <<'EOF_PROXY_COMMON'
+# ============================================================
 # 反向代理公共配置
+#
+# 作用：统一设置代理协议版本、转发头与超时时间
+# 用法：在 location 中 include /etc/nginx/snippets/proxy-common.conf;
+# ============================================================
+
+# 与上游服务使用 HTTP/1.1，兼容长连接与 WebSocket
 proxy_http_version 1.1;
+
+# 转发原始 Host、客户端 IP 与协议类型
 proxy_set_header Host              $host;
 proxy_set_header X-Real-IP         $remote_addr;
 proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto $scheme;
+
+# 与上游建立连接、读取、发送的超时时间
 proxy_connect_timeout 10s;
 proxy_read_timeout    60s;
 proxy_send_timeout    60s;
@@ -1044,10 +1281,21 @@ EOF_PROXY_COMMON
     chmod 644 "${NGINX_SNIPPET_DIR}/proxy-common.conf"
 
     cat > "${NGINX_SNIPPET_DIR}/websocket.conf" <<'EOF_WS_SNIPPET'
-# WebSocket / 长连接升级头
+# ============================================================
+# WebSocket / 长连接升级配置
+#
+# 用法：仅需 WebSocket 的 location 中 include 本文件
+#       include /etc/nginx/snippets/websocket.conf;
+# ============================================================
+
+# WebSocket 依赖 HTTP/1.1 的 Upgrade 机制
 proxy_http_version 1.1;
+
+# 传递升级头，完成协议切换
 proxy_set_header Upgrade    $http_upgrade;
 proxy_set_header Connection "upgrade";
+
+# 关闭代理缓冲，降低长连接消息延迟
 proxy_buffering off;
 EOF_WS_SNIPPET
     chmod 644 "${NGINX_SNIPPET_DIR}/websocket.conf"
@@ -1056,34 +1304,70 @@ EOF_WS_SNIPPET
 write_main_site() {
     ui_step "生成 main 主站配置"
     cat > "${NGINX_CONF_DIR}/main.conf" <<'EOF_MAIN'
-# 主站（main）配置（由 install_nginx.sh 生成）
+# ============================================================
+# 主站（main）配置（由 install_nginx.sh 自动生成）
+#
+# 架构说明：
+#   - 外部客户端先连接 stream 层的 TCP 443（见 stream_sni.conf）
+#   - stream 层按 SNI 将流量转发到本文件监听的内部回环端口
+#   - 本文件只监听 127.0.0.1，不直接暴露到公网
+#
+# 当前主站域名：__PRIMARY_DOMAIN__
+# 证书配置：由 /etc/nginx/snippets/ssl.conf 统一提供
+# ============================================================
 server {
+    # ---------- 内部监听 ----------
+    # 仅绑定本机回环地址，端口由脚本 MAIN_BACKEND_PORT 决定
+    # ssl：在此层完成 TLS 终止
+    # proxy_protocol：接收 stream 层传来的真实客户端 IP
     listen 127.0.0.1:__MAIN_BACKEND_PORT__ ssl proxy_protocol;
+
+    # ---------- HTTP/3 / QUIC 监听（默认关闭） ----------
+    # 开启后会额外监听 UDP 端口，可能与其它 QUIC 服务冲突
+    # 如需启用：在脚本顶部设置 HTTP3_ENABLE="1"
+    __HTTP3_COMMENT_LINE__
     __HTTP3_LISTEN_V4__
     __HTTP3_LISTEN_V6__
-    http2 on;
-    http3 on;
-    quic_retry on;
 
+    # ---------- 协议支持 ----------
+    # HTTP/2 基于 TCP，始终开启
+    http2 on;
+
+    # 以下两条仅在 HTTP/3 启用时生成，关闭时为空
+    __HTTP3_ON_LINE__
+    __QUIC_RETRY_LINE__
+
+    # ---------- 域名与证书 ----------
+    # 主站域名由「主站子域名 + 基础域名」自动拼接
     server_name __PRIMARY_DOMAIN__;
+
+    # 统一证书配置（证书不会拷贝到 /etc/nginx）
     include /etc/nginx/snippets/ssl.conf;
 
+    # ---------- 站点根目录 ----------
+    # 默认首页文件
     root /var/www/html;
     index index.html index.htm;
 
+    # ---------- 日志 ----------
     access_log /var/log/nginx/main_access.log;
     error_log  /var/log/nginx/main_error.log;
 
+    # ---------- 健康检查 ----------
+    # 用于负载均衡/监控探活，返回纯文本 ok
     location = /healthz {
         default_type text/plain;
         return 200 "ok\n";
     }
 
+    # ---------- 静态文件 ----------
+    # 按请求路径查找文件，不存在时返回 404
     location / {
         try_files $uri $uri/ =404;
     }
 
-    # 可选：静态资源缓存
+    # ---------- 可选：静态资源缓存 ----------
+    # 启用后可减少重复请求，按需取消注释
     # location ~* \.(css|js|jpg|jpeg|png|gif|svg|ico|woff2?)$ {
     #     expires 30d;
     #     add_header Cache-Control "public, max-age=2592000";
@@ -1098,11 +1382,21 @@ EOF_MAIN
 write_redirect_site() {
     if [[ "${HTTP_REDIRECT}" == "1" ]]; then
         cat > "${NGINX_CONF_DIR}/redirect-http.conf" <<'EOF_REDIRECT'
-# HTTP → HTTPS 跳转
+# ============================================================
+# HTTP → HTTPS 跳转（由 install_nginx.sh 自动生成）
+#
+# 作用：监听 TCP 80，将所有 HTTP 请求永久重定向到 HTTPS
+# 关闭方式：脚本顶部设置 HTTP_REDIRECT="0"
+# ============================================================
 server {
+    # 同时监听 IPv4 与 IPv6 的 80 端口
     listen 80;
     listen [::]:80;
+
+    # 仅对主站域名生效
     server_name __PRIMARY_DOMAIN__;
+
+    # 301 永久跳转，保留原始路径与查询参数
     return 301 https://$host$request_uri;
 }
 EOF_REDIRECT
@@ -1116,26 +1410,49 @@ EOF_REDIRECT
 write_stream_sni() {
     ui_step "生成 stream SNI 分流配置"
     cat > "${NGINX_STREAM_DIR}/stream_sni.conf" <<'EOF_STREAM'
-# stream SNI 分流（由 install_nginx.sh 生成）
-# 默认仅监听 TCP 443
+# ============================================================
+# stream SNI 分流配置（由 install_nginx.sh 自动生成）
+#
+# 作用：
+#   - 仅监听 TCP 443（不占用 UDP 443）
+#   - 在 TLS 握手前读取 SNI 域名
+#   - 按域名把流量转发到对应的内部后端
+#
+# 当前仅启用 main 主站；新增站点时：
+#   1. 在 map 中增加「域名 后端名称;」
+#   2. 在 upstream 区域增加同名后端
+#   3. nginx -t && systemctl reload nginx
+# ============================================================
+
+# 根据 SNI 选择后端名称；未匹配的域名默认回到 main 主站
 map $ssl_preread_server_name $backend_name {
     __PRIMARY_DOMAIN__ main_backend;
     default            main_backend;
 }
 
+# main 主站内部后端：与 conf.d/main.conf 的 listen 端口保持一致
 upstream main_backend {
     server 127.0.0.1:__MAIN_BACKEND_PORT__;
 }
 
 server {
+    # 对外监听 TCP 443，reuseport 提升多 worker 下的分发性能
     listen 443 reuseport;
     listen [::]:443 reuseport;
 
+    # 开启 SNI 预读，在不解密 TLS 的情况下拿到域名
     ssl_preread on;
+
+    # 向后端传递 PROXY 协议头，便于还原真实客户端 IP
     proxy_protocol on;
+
+    # 连接后端超时
     proxy_connect_timeout 10s;
+
+    # 长连接保持时间，适配 WebSocket / 大流量场景
     proxy_timeout 1h;
 
+    # 按 map 结果转发
     proxy_pass $backend_name;
 }
 EOF_STREAM
@@ -1652,12 +1969,16 @@ ${C_GREEN}============================================================${C_RESET}
 ${C_GREEN} 安装完成${C_RESET}
 ${C_GREEN}============================================================${C_RESET}
 
+基础域名:      ${BASE_DOMAIN}
+主站子域名:    ${MAIN_SUBDOMAIN}
 主站配置:      ${NGINX_DIR}/conf.d/main.conf
+主站域名:      ${PRIMARY_DOMAIN}
 80 跳转:       $([[ "${HTTP_REDIRECT}" == "1" ]] && echo "${NGINX_DIR}/conf.d/redirect-http.conf" || echo "未生成")
 Stream 分流:   ${NGINX_DIR}/stream.conf.d/stream_sni.conf
 场景模板:      ${NGINX_CONF_DIR}/*.conf.example
 模板说明:      ${NGINX_CONF_DIR}/README.md
 统一证书:      ${SSL_CERT_PATH}（未拷贝到 /etc/nginx）
+统一私钥:      ${SSL_KEY_PATH}（未拷贝到 /etc/nginx）
 HTTP/3:        ${http3_info}
 
 常用命令:

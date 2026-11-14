@@ -44,7 +44,7 @@
 
 ## 4. 证书模型
 
-- 安装时只询问一次证书、私钥路径。
+- 证书/私钥路径支持模板，按基础域名自动替换，安装时可回车采用默认值。
 - 不拷贝证书，不修改证书权限。
 - 生成 `/etc/nginx/snippets/ssl.conf`，所有站点和模板统一 include。
 - 校验证书可读、未过期、与私钥匹配、SAN 覆盖主域名。
@@ -54,18 +54,20 @@
 
 默认交互：
 
-1. 主站域名
-2. 证书路径
-3. 私钥路径
-4. 是否生成 80 → 443 跳转
+1. 基础域名（例如 `abc.com`）
+2. 主站子域名（例如 `main`，自动拼接为 `main.abc.com`；`@` 表示使用根域名）
+3. 证书路径（默认按模板自动生成，可直接回车）
+4. 私钥路径（默认按模板自动生成，可直接回车）
+5. 是否生成 80 → 443 跳转
 
 无交互：
 
 - 编辑脚本顶部：
   - `NON_INTERACTIVE="1"`
-  - `PRIMARY_DOMAIN`
-  - `SSL_CERT_PATH`
-  - `SSL_KEY_PATH`
+  - `BASE_DOMAIN`
+  - `MAIN_SUBDOMAIN`（默认 `main`）
+  - `SSL_CERT_PATH_TPL` / `SSL_KEY_PATH_TPL`（按 `__BASE_DOMAIN__` 自动替换）
+  - 或直接填写 `SSL_CERT_PATH` / `SSL_KEY_PATH`
 
 缺失时交互模式会提示；无交互模式直接报错。
 
