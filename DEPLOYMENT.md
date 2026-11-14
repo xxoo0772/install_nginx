@@ -32,7 +32,7 @@ sudo ./install_nginx.sh
 2. 准备证书与私钥（建议全链证书）
 3. 确认证书 SAN/CN 覆盖全部目标域名（支持通配符），且证书与私钥匹配、未过期
 4. 复制并修改配置文件：`cp env.example env`
-5. 防火墙放行：TCP `443/2096/2099/8443`、UDP `443`（HTTP/3）、以及 stream 分流所需的 TCP 端口
+5. 防火墙放行：TCP `443/2096/2099/8443`、UDP `443`（HTTP/3，若改端口则为 `HTTP3_PORT`）、以及 stream 分流所需的 TCP 端口
 
 ## 3. 配置文件（env）示例
 > 模板见 `env.example`，复制为 `env` 后修改。`env` 是普通 shell 文件，支持变量与引号。
@@ -88,6 +88,11 @@ TUN_REUSE_MAIN_CERT=1
 
 # TUN（Tunnel）/vless 反代上游地址
 VLESS_UPSTREAM=http://127.0.0.1:10000
+
+# HTTP/3 (QUIC)
+# 443/udp 被其他应用占用时：设 HTTP3_ENABLE=0，或改 HTTP3_PORT=8443
+HTTP3_ENABLE=1
+HTTP3_PORT=443
 
 # 可选：fail2ban 防暴力破解参数
 ENABLE_FAIL2BAN_TEMPLATE=1
@@ -179,7 +184,8 @@ curl -kI https://api.abc.com/healthz
 curl -kI https://tun.abc.com/healthz
 curl -kI https://tun.abc.com/vless
 
-# HTTP/3 验证（curl 需支持 --http3，且 UDP 443 已放行）
+# HTTP/3 验证（curl 需支持 --http3；端口为 HTTP3_PORT，默认 443）
+# 若修改了 HTTP3_PORT，请先通过 HTTPS 获取 Alt-Svc，或放行对应 UDP 端口
 curl --http3 -sI https://main.abc.com/healthz
 
 # 证书与私钥匹配 / SAN 检查
@@ -267,6 +273,20 @@ sudo tail -n 200 /var/log/nginx/stream_sni.log
 - 现象：编译 brotli 源码时出现 `error: ... [-Werror=vla-parameter]`，随后 `all warnings being treated as errors`
 - 原因：Nginx 默认开启 `-Werror`，新版 GCC 对 brotli 的 VLA 参数声明发出警告（`-Wvla-parameter` 为 GCC 11+ 引入）
 - 处理：脚本会自动探测编译器；支持时在 `--with-cc-opt` 中加入 `-Wno-error=vla-parameter`。如自定义编译参数，请确保该选项位于 `-Werror` 之后
+
+3.5 启动失败：`duplicate listen options for 0.0.0.0:443`
+- 现象：`nginx: [emerg] duplicate listen options for 0.0.0.0:443`
+- 原因：同一个 `address:port` 上 `reuseport` 只能声明一次；多个站点都写 `listen 443 quic reuseport;` 会冲突
+- 处理：脚本中四个站点的 HTTP/3 监听为 `listen 443 quic;`，仅 Stream 的 TCP 监听保留 `reuseport`。自定义配置时同一端口最多在一个 server 块中写 `reuseport`
+
+3.6 其他应用占用 UDP 443（QUIC）
+- 限制：Nginx `stream ssl_preread` 仅支持 TCP；QUIC SNI 在加密 Initial 包中，Nginx 无法按 SNI 转发 UDP/QUIC
+- 方案 A：其他应用使用其他 UDP 端口或独立 IP
+- 方案 B：关闭 Nginx HTTP/3：`HTTP3_ENABLE=0`
+- 方案 C：Nginx HTTP/3 改用其他 UDP 端口：`HTTP3_ENABLE=1`、`HTTP3_PORT=8443`（Alt-Svc 自动跟随端口，记得放行防火墙）
+- 方案 D：其他应用若也是 HTTP/3，交由 Nginx 统一终止 QUIC 并按 `server_name` 反代，不要重复监听 443/udp
+- 如果需要同一 UDP 443 上按 SNI 分流任意 QUIC 应用，需要额外部署 QUIC-aware L4 路由器（解析 Initial 包 SNI + 连接 ID 亲和），非 Nginx 原生能力
+- 安装时会用 `ss` 检测 `HTTP3_PORT` 是否已被占用；冲突会提前报错。重装且旧 Nginx 正在运行时跳过该检查
 
 4. Fail2Ban 模板启用（脚本不自动安装 fail2ban）
 ```bash

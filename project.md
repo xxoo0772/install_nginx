@@ -24,7 +24,8 @@
 
 # 编译与脚本工程要求
 - `./configure` 参数必须使用 Bash 数组：`./configure "${CONF_ARGS[@]}"`
-- 必须启用：HTTP/2、HTTP/3、SSL、RealIP、Stub Status、WebDAV、Stream、Stream SSL、Stream SSL Preread
+- 必须编译启用：HTTP/2、HTTP/3、SSL、RealIP、Stub Status、WebDAV、Stream、Stream SSL、Stream SSL Preread
+- HTTP/3 运行期监听可通过 `HTTP3_ENABLE` / `HTTP3_PORT` 控制，以适配 443/udp 被其他 QUIC 应用占用的场景
 - 使用 `set -Eeuo pipefail`，统一错误处理与彩色状态输出
 - 配置文件生成必须使用 `cat <<'EOF'` 防变量误展开
 
@@ -54,6 +55,7 @@
 - 开启 OCSP stapling（证书需含完整中间链）
 - 开启 HSTS、CSP（禁止 `unsafe-inline`）、X-Frame-Options、X-Content-Type-Options、Referrer-Policy、Permissions-Policy
 - 支持 HTTP/3：QUIC 直连 UDP 443 + `Alt-Svc`（与 stream TCP SNI 分流并存）
+- QUIC 端口可配置：`HTTP3_ENABLE` 控制启停，`HTTP3_PORT` 控制 UDP 端口；Nginx 无法对 UDP/QUIC 做 SNI 分流
 
 5. systemd 沙箱
 - `ProtectSystem=strict`、`ProtectHome=true`、`PrivateTmp=true`、`NoNewPrivileges=true`
@@ -90,7 +92,7 @@
 # 架构与模块说明
 - `install_nginx.sh`: 唯一执行体，自动加载同目录 `env`，负责前置校验 → 参数采集/证书校验 → 备份 → 依赖安装 → 源码校验/编译 → 配置生成 → 服务注册 → 启动 → 清理
 - `env.example` / `env`: 供应链校验值、版本覆盖、域名、证书路径、限流/Fail2Ban 参数；`env` 为用户本地配置
-- 运行链路: 客户端 → stream TCP SNI 分流（主站/TUN（Tunnel）/web_mux）→ 本地 TLS 终止；HTTP/3 走 UDP 443 直连终止
+- 运行链路: 客户端 → stream TCP SNI 分流（主站/TUN（Tunnel）/web_mux）→ 本地 TLS 终止；HTTP/3 走 UDP（默认 443，可配置）直连终止
 - 真实 IP: stream 向下游发送 PROXY protocol，http 层 `real_ip_header proxy_protocol` 还原
 - 模块: `http_ssl/http_v2/http_v3`、`http_realip`、`http_stub_status`、`http_dav` + `dav-ext`、`stream/stream_ssl/stream_ssl_preread`、`ngx_brotli`、`headers-more`、`ngx-fancyindex`、`jemalloc`
 
@@ -106,3 +108,5 @@
 - 2026-11: TLS 供应链迁移：quictls（已归档）→ 官方 OpenSSL 3.5.9 LTS；Nginx 升级到 1.31.8；jemalloc 5.4.0；fancyindex 0.6.0；headers-more 0.41；ngx_brotli 固定到 v1.0.0rc commit；新增 commit 精确抓取与回退逻辑。
 - 2026-11: 编译兼容修复：动态探测编译器能力，在支持时于 `--with-cc-opt` 增加 `-Wno-error=vla-parameter`，解决 ngx_brotli 在新版 GCC 下触发 `-Werror=vla-parameter` 导致的编译失败，同时兼容 GCC 10。
 - 2026-11: 配置方式改为模板化：`env.example` 为模板，用户复制为 `env`；脚本自动加载同目录 `env`，新增 `--interactive` 与 `ENV_FILE` 覆盖；`env` 加入 `.gitignore`；支持 `git clone` 后直接 `sudo ./install_nginx.sh`。
+- 2026-11: 修复 HTTP/3 多站点启动失败：同一 `address:port` 上 `reuseport` 只能声明一次，四个站点的 `listen 443 quic` 移除 `reuseport`，仅 Stream TCP 监听保留。
+- 2026-11: 新增 `HTTP3_ENABLE` / `HTTP3_PORT`：443/udp 被其他 QUIC 应用占用时可关闭 Nginx HTTP/3 或改用其他 UDP 端口；文档说明 Nginx 无法对 QUIC 做 SNI 分流。

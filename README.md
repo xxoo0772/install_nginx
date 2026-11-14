@@ -34,7 +34,7 @@
 - **源码编译**：Nginx + OpenSSL + jemalloc，支持 CPU 多线程并行编译。
 - **供应链安全**：HTTPS 下载、SHA256 校验、Git commit pin；严格模式下缺值直接拒绝执行。
 - **证书校验**：导入前校验证书可解析、未过期、证书与私钥匹配、SAN/CN 覆盖目标域名。
-- **HTTP/2 + HTTP/3**：TCP 443 走 Stream SNI 分流，UDP 443 直连 QUIC，并下发 `Alt-Svc`。
+- **HTTP/2 + HTTP/3**：TCP 443 走 Stream SNI 分流，UDP 443 直连 QUIC，并下发 `Alt-Svc`（QUIC 端口可通过 `HTTP3_PORT` 调整，或 `HTTP3_ENABLE=0` 关闭）。
 - **Stream SNI 分流**：主站、TUN（Tunnel）、WebDAV/API 共用 443，按 SNI 转发。
 - **真实客户端 IP**：Stream 向下游发送 PROXY protocol，HTTP 层 `real_ip` 还原真实 IP。
 - **WebDAV 防滥用**：读写分层限速、并发限制、`auth_delay`、Fail2Ban 模板。
@@ -56,7 +56,7 @@ Client                   │                                             │
   │                      │      ├─ tun.abc.com  ─► 127.0.0.1:9443     │
   │                      │      └─ dav/api      ─► 127.0.0.1:7443     │
   │                      │                                              │
-  │  UDP 443  ──────────►│  http/3 (QUIC) 直接终止 TLS                 │
+  │  UDP 443  ──────────►│  http/3 (QUIC) 直接终止 TLS（端口可配置）    │
   │                      │      ├─ main.abc.com                        │
   │                      │      ├─ dav.abc.com                         │
   │                      │      ├─ api.abc.com                         │
@@ -176,6 +176,15 @@ sudo ./install_nginx.sh --interactive
 | `TUN_CERT_SRC` / `TUN_KEY_SRC` | 空 | TUN 证书（可复用主站） |
 | `*_REUSE_MAIN_CERT` | `1` | 未显式提供时复用主站证书 |
 | `VLESS_UPSTREAM` | `http://127.0.0.1:10000` | TUN `/vless` 上游地址 |
+
+### HTTP/3 (QUIC)
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `HTTP3_ENABLE` | `1` | `1` 启用 Nginx HTTP/3；`0` 不监听 UDP（适合其他应用占用 443/udp） |
+| `HTTP3_PORT` | `443` | Nginx QUIC 监听端口；443/udp 被占用时可改为 `8443` 等 |
+
+> QUIC 的 SNI 位于加密的 Initial 包中，Nginx 的 `stream ssl_preread` 只支持 TCP，**无法像 TCP 那样按 SNI 复用 UDP 443**。若其他 QUIC 应用必须使用 443/udp，请使用 `HTTP3_ENABLE=0` 关闭 Nginx HTTP/3，或使用 `HTTP3_PORT` 将 Nginx HTTP/3 移到其他 UDP 端口。
 
 ### Fail2Ban 模板
 
@@ -440,6 +449,42 @@ cc1: all warnings being treated as errors
 --with-cc-opt="-O3 -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wno-error=vla-parameter"
 ```
 
+### 9. `duplicate listen options for 0.0.0.0:443`
+
+```text
+nginx: [emerg] duplicate listen options for 0.0.0.0:443
+```
+
+原因：同一个 `address:port` 上 `reuseport` 只能声明一次。多个站点都写 `listen 443 quic reuseport;` 时会冲突（`reuseport` 会给 listen 打上“显式选项”标记）。
+
+处理：脚本中四个站点的 HTTP/3 监听已改为 `listen 443 quic;`，仅 Stream 的 TCP 监听保留 `reuseport`。自定义配置时，同一端口最多只在一个 server 块里写 `reuseport`。
+
+### 10. 其他应用占用了 443/udp（QUIC）
+
+Nginx 的 `stream ssl_preread` 只支持 TCP，QUIC 的 SNI 又在加密的 Initial 包中，**Nginx 无法像 TCP 那样按 SNI 转发 UDP/QUIC**。可选方案：
+
+1. 其他应用不是 HTTP/3（例如自定义 QUIC/VPN）：为它使用其他 UDP 端口或其他 IP。
+2. 临时关闭 Nginx HTTP/3：
+
+```bash
+# env
+HTTP3_ENABLE=0
+```
+
+3. 把 Nginx HTTP/3 移到其他 UDP 端口（`Alt-Svc` 会自动带上新端口）：
+
+```bash
+# env
+HTTP3_ENABLE=1
+HTTP3_PORT=8443
+```
+
+4. 如果其他应用也是 HTTP/3：让 Nginx 统一终止 QUIC，按 `server_name` 反代到该应用，不要再让该应用监听 443/udp。
+
+> 安装时会用 `ss` 检测 `HTTP3_PORT` 是否已被占用；若冲突会直接提示，而不是等到启动时失败。重装时若旧 Nginx 正在运行，会跳过该检查。
+
+如果需要“同一个 UDP 443 按 SNI 分流多个任意 QUIC 应用”，需要在 Nginx 前面部署 QUIC-aware L4 路由器（解析 Initial 包 SNI 并做连接 ID 亲和），这不是 Nginx 原生能力。
+
 ## 升级与校验
 
 ### 升级版本
@@ -459,7 +504,7 @@ shellcheck -S warning install_nginx.sh
 ### 运行期校验
 
 ```bash
-# 监听端口（TCP 443/2096/2099/8443 + UDP 443）
+# 监听端口（TCP 443/2096/2099/8443 + UDP ${HTTP3_PORT:-443}）
 sudo ss -lntup | grep nginx
 
 # 版本与编译参数

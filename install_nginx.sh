@@ -72,6 +72,12 @@ API_REUSE_MAIN_CERT="${API_REUSE_MAIN_CERT:-1}"
 TUN_REUSE_MAIN_CERT="${TUN_REUSE_MAIN_CERT:-1}"
 VLESS_UPSTREAM="${VLESS_UPSTREAM:-http://127.0.0.1:10000}"
 
+#================= HTTP/3 (QUIC) =================
+# 1=启用 Nginx HTTP/3；0=不监听 UDP（适用于其他应用占用 443/udp）
+HTTP3_ENABLE="${HTTP3_ENABLE:-1}"
+# Nginx QUIC 监听端口；若 443/udp 被占用，可改为 8443 等并放行防火墙
+HTTP3_PORT="${HTTP3_PORT:-443}"
+
 MAIN_CERT_DST=""
 MAIN_KEY_DST=""
 DAV_CERT_DST=""
@@ -238,6 +244,38 @@ validate_domain_or_exit() {
     local label="$2"
     if [[ ! "${v}" =~ ^[A-Za-z0-9.-]+$ ]]; then
         log_err "${label} 格式不合法: ${v}"
+        exit 1
+    fi
+}
+
+validate_http3_or_exit() {
+    if [[ "${HTTP3_ENABLE}" != "0" && "${HTTP3_ENABLE}" != "1" ]]; then
+        log_err "HTTP3_ENABLE 只能是 0 或 1，当前: ${HTTP3_ENABLE}"
+        exit 1
+    fi
+    if [[ ! "${HTTP3_PORT}" =~ ^[0-9]+$ ]] || (( HTTP3_PORT < 1 || HTTP3_PORT > 65535 )); then
+        log_err "HTTP3_PORT 必须是 1-65535，当前: ${HTTP3_PORT}"
+        exit 1
+    fi
+}
+
+check_http3_port_available() {
+    [[ "${HTTP3_ENABLE}" == "1" ]] || return 0
+    command -v ss >/dev/null 2>&1 || return 0
+
+    # 重装场景：旧 Nginx 自身占用该端口是正常的
+    if [[ -f /run/nginx.pid ]]; then
+        local nginx_pid
+        nginx_pid="$(cat /run/nginx.pid 2>/dev/null || true)"
+        if [[ -n "${nginx_pid}" ]] && kill -0 "${nginx_pid}" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    if ss -lunH "sport = :${HTTP3_PORT}" 2>/dev/null | grep -q .; then
+        log_err "UDP/${HTTP3_PORT} 已被占用，Nginx HTTP/3 无法绑定"
+        ss -lunp "sport = :${HTTP3_PORT}" 2>/dev/null | sed 's/^/[udp] /' || true
+        log_err "处理方式：设置 HTTP3_ENABLE=0（关闭 Nginx HTTP/3），或设置 HTTP3_PORT=<其他 UDP 端口>"
         exit 1
     fi
 }
@@ -889,7 +927,7 @@ http {
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     add_header Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=()" always;
     add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self';" always;
-    add_header Alt-Svc 'h3=":443"; ma=86400' always;
+    __ALT_SVC_HEADER__
 
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers on;
@@ -953,8 +991,9 @@ EOF_STREAM
 server {
     listen 127.0.0.1:1111 ssl proxy_protocol;
     # HTTP/3 直连 UDP 443，与 stream 的 TCP SNI 分流并存
-    listen 443 quic reuseport;
-    listen [::]:443 quic reuseport;
+    # HTTP/3 监听（由 HTTP3_ENABLE / HTTP3_PORT 动态生成）
+    __HTTP3_LISTEN_V4__
+    __HTTP3_LISTEN_V6__
     http2 on;
     http3 on;
     quic_retry on;
@@ -1010,8 +1049,9 @@ EOF_PROXY
 server {
     # web_mux: API + WebDAV 在同一 7443 端口按 server_name 分流
     listen 127.0.0.1:7443 ssl proxy_protocol;
-    listen 443 quic reuseport;
-    listen [::]:443 quic reuseport;
+    # HTTP/3 监听（由 HTTP3_ENABLE / HTTP3_PORT 动态生成）
+    __HTTP3_LISTEN_V4__
+    __HTTP3_LISTEN_V6__
     http2 on;
     http3 on;
     quic_retry on;
@@ -1090,8 +1130,9 @@ EOF_DAV
     cat > "${NGINX_CONF_DIR}/api_site.conf" <<'EOF_API'
 server {
     listen 127.0.0.1:7443 ssl proxy_protocol;
-    listen 443 quic reuseport;
-    listen [::]:443 quic reuseport;
+    # HTTP/3 监听（由 HTTP3_ENABLE / HTTP3_PORT 动态生成）
+    __HTTP3_LISTEN_V4__
+    __HTTP3_LISTEN_V6__
     http2 on;
     http3 on;
     quic_retry on;
@@ -1126,8 +1167,9 @@ EOF_API
     cat > "${NGINX_CONF_DIR}/tun_stream_backend.conf" <<'EOF_TUN'
 server {
     listen 127.0.0.1:9443 ssl proxy_protocol;
-    listen 443 quic reuseport;
-    listen [::]:443 quic reuseport;
+    # HTTP/3 监听（由 HTTP3_ENABLE / HTTP3_PORT 动态生成）
+    __HTTP3_LISTEN_V4__
+    __HTTP3_LISTEN_V6__
     http2 on;
     http3 on;
     quic_retry on;
@@ -1167,6 +1209,8 @@ EOF_TUN
     local esc_main_cert esc_main_key esc_dav_cert esc_dav_key esc_api_cert esc_api_key esc_tun_cert esc_tun_key esc_vless_upstream
     local syslog_access_line="" syslog_error_line="" syslog_dav_access_line=""
     local esc_syslog_access esc_syslog_error esc_syslog_dav_access
+    local http3_listen_v4="" http3_listen_v6="" alt_svc_line=""
+    local esc_http3_v4 esc_http3_v6 esc_alt_svc
 
     # Debian 13 最小化系统可能没有 rsyslog；仅当 /dev/log 存在时才启用 journald 通道
     if [[ -S /dev/log ]]; then
@@ -1194,11 +1238,29 @@ EOF_TUN
     esc_tun_key="$(escape_sed_replacement "${TUN_KEY_DST}")"
     esc_vless_upstream="$(escape_sed_replacement "${VLESS_UPSTREAM}")"
 
+    if [[ "${HTTP3_ENABLE}" == "1" ]]; then
+        http3_listen_v4="listen ${HTTP3_PORT} quic;"
+        http3_listen_v6="listen [::]:${HTTP3_PORT} quic;"
+        alt_svc_line="add_header Alt-Svc 'h3=\":${HTTP3_PORT}\"; ma=86400' always;"
+    else
+        log_warn "HTTP3_ENABLE=0：Nginx 不监听 UDP/${HTTP3_PORT}，请确保其他 QUIC 应用可使用该端口"
+    fi
+    esc_http3_v4="$(escape_sed_replacement "${http3_listen_v4}")"
+    esc_http3_v6="$(escape_sed_replacement "${http3_listen_v6}")"
+    esc_alt_svc="$(escape_sed_replacement "${alt_svc_line}")"
+
     sed -i "s|__MAIN_DOMAIN__|${esc_main_domain}|g; s|__DAV_DOMAIN__|${esc_dav_domain}|g; s|__API_DOMAIN__|${esc_api_domain}|g; s|__TUN_DOMAIN__|${esc_tun_domain}|g" "${NGINX_STREAM_DIR}/stream_sni.conf"
     sed -i "s|__MAIN_DOMAIN__|${esc_main_domain}|g; s|__MAIN_CERT__|${esc_main_cert}|g; s|__MAIN_KEY__|${esc_main_key}|g" "${NGINX_CONF_DIR}/proxy_site.conf"
     sed -i "s|__DAV_DOMAIN__|${esc_dav_domain}|g; s|__DAV_CERT__|${esc_dav_cert}|g; s|__DAV_KEY__|${esc_dav_key}|g" "${NGINX_CONF_DIR}/webdav_drive.conf"
     sed -i "s|__API_DOMAIN__|${esc_api_domain}|g; s|__API_CERT__|${esc_api_cert}|g; s|__API_KEY__|${esc_api_key}|g" "${NGINX_CONF_DIR}/api_site.conf"
     sed -i "s|__TUN_DOMAIN__|${esc_tun_domain}|g; s|__TUN_CERT__|${esc_tun_cert}|g; s|__TUN_KEY__|${esc_tun_key}|g; s|__VLESS_UPSTREAM__|${esc_vless_upstream}|g" "${NGINX_CONF_DIR}/tun_stream_backend.conf"
+
+    sed -i "s|__HTTP3_LISTEN_V4__|${esc_http3_v4}|g; s|__HTTP3_LISTEN_V6__|${esc_http3_v6}|g" \
+        "${NGINX_CONF_DIR}/proxy_site.conf" \
+        "${NGINX_CONF_DIR}/webdav_drive.conf" \
+        "${NGINX_CONF_DIR}/api_site.conf" \
+        "${NGINX_CONF_DIR}/tun_stream_backend.conf"
+    sed -i "s|__ALT_SVC_HEADER__|${esc_alt_svc}|" "${NGINX_DIR}/conf/nginx.conf"
 
     sed -i "s|__SYSLOG_ACCESS__|${esc_syslog_access}|; s|__SYSLOG_ERROR__|${esc_syslog_error}|" "${NGINX_DIR}/conf/nginx.conf"
     sed -i "s|__SYSLOG_DAV_ACCESS__|${esc_syslog_dav_access}|" "${NGINX_CONF_DIR}/webdav_drive.conf"
@@ -1503,7 +1565,7 @@ ${GREEN}[完成]${RESET} Nginx 编译与企业级安全部署结束
    https://${API_DOMAIN}/healthz
    https://${TUN_DOMAIN}/healthz
    https://${TUN_DOMAIN}/vless
-   HTTP/3 测试（需 curl 支持）:
+   HTTP/3 测试（HTTP3_ENABLE=${HTTP3_ENABLE}, UDP/${HTTP3_PORT}；需 curl 支持 --http3）:
    curl --http3 -sI https://${MAIN_DOMAIN}/healthz
 5) Fail2Ban 模板（未自动安装/启用）:
    /etc/nginx/security/fail2ban/filter.d/nginx-webdav-auth.conf
@@ -1555,6 +1617,8 @@ main() {
     check_os_compat
     install_dependencies
     require_cmds
+    validate_http3_or_exit
+    check_http3_port_available
     check_version_currency
     collect_deploy_inputs
     backup_existing_installation
