@@ -80,21 +80,21 @@ Client                   │                                             │
 
 ## 快速开始
 
-### 1. 准备文件
+### 1. 克隆仓库
 
-将以下文件放到同一目录（示例：`/opt/nginx-deploy`）：
-
-```text
-/opt/nginx-deploy/
-├── install_nginx.sh
-├── nginx-build.env
-├── project.md
-└── DEPLOYMENT.md
+```bash
+git clone <repository-url> nginx-deploy
+cd nginx-deploy
 ```
 
-### 2. 修改环境变量
+### 2. 生成并修改配置
 
-编辑 `nginx-build.env`，至少修改：
+```bash
+cp env.example env
+vim env
+```
+
+至少修改：
 
 ```bash
 STRICT_SUPPLYCHAIN=1
@@ -112,32 +112,32 @@ NON_INTERACTIVE=1
 ```
 
 > `DAV/API/TUN` 证书留空时，默认复用主站证书。请确认主站证书覆盖这些子域（或使用通配符证书），否则 `STRICT_CERT_SAN=1` 会拒绝安装。
+>
+> `env` 包含实际域名与证书路径，已加入 `.gitignore`，请不要提交。
 
 ### 3. 非交互安装
 
 ```bash
-sudo bash -c '
-  set -a
-  source /opt/nginx-deploy/nginx-build.env
-  set +a
-  /opt/nginx-deploy/install_nginx.sh
-'
+sudo ./install_nginx.sh
 ```
+
+`install_nginx.sh` 会自动加载同目录下的 `env`。
 
 ### 4. 交互安装
 
 ```bash
-sudo bash -c '
-  set -a
-  source /opt/nginx-deploy/nginx-build.env
-  set +a
-  NON_INTERACTIVE=0 /opt/nginx-deploy/install_nginx.sh
-'
+sudo ./install_nginx.sh --interactive
 ```
+
+> 如需使用其他配置文件：
+>
+> ```bash
+> sudo ENV_FILE=/path/to/env ./install_nginx.sh
+> ```
 
 ## 环境变量说明
 
-完整模板见 [`nginx-build.env`](./nginx-build.env)。
+完整模板见 [`env.example`](./env.example)，使用前复制为 `env`。
 
 ### 供应链与证书
 
@@ -199,7 +199,7 @@ sudo bash -c '
 ### 安装
 
 ```bash
-sudo bash -c 'set -a; source /opt/nginx-deploy/nginx-build.env; set +a; /opt/nginx-deploy/install_nginx.sh'
+sudo ./install_nginx.sh
 ```
 
 安装流程：
@@ -221,13 +221,13 @@ sudo bash -c 'set -a; source /opt/nginx-deploy/nginx-build.env; set +a; /opt/ngi
 
 ```bash
 # 交互式卸载（需输入确认短语 UNINSTALL NGINX）
-sudo /opt/nginx-deploy/install_nginx.sh --uninstall
+sudo ./install_nginx.sh --uninstall --interactive
 
 # 卸载但保留 /var/www 数据
-sudo /opt/nginx-deploy/install_nginx.sh --uninstall --preserve-www
+sudo ./install_nginx.sh --uninstall --preserve-www --interactive
 
 # 非交互强制卸载（谨慎）
-sudo NON_INTERACTIVE=1 FORCE_UNINSTALL=1 /opt/nginx-deploy/install_nginx.sh --uninstall --yes
+sudo ./install_nginx.sh --uninstall --yes
 ```
 
 卸载会删除：
@@ -400,7 +400,7 @@ sudo fail2ban-client status nginx-webdav-auth
 严格供应链模式已启用，但未提供 xxx 的 SHA256
 ```
 
-处理方式：补全 `nginx-build.env` 中的 SHA256 / commit pin，并与版本严格对应。
+处理方式：补全 `env` 中的 SHA256 / commit pin，并与版本严格对应。
 
 ### 3. HTTP/3 不生效
 
@@ -425,11 +425,26 @@ Debian 13 最小化系统可能没有 `/dev/log`，脚本会自动跳过 syslog 
 
 确认 Stream 配置已加载，并检查 `stream_sni.log` 中的 `backend` 字段是否为 `proxy_web_mux`。
 
+### 8. 编译报错 `-Werror=vla-parameter`
+
+```text
+error: argument 5 of type 'const uint8_t *' ... [-Werror=vla-parameter]
+cc1: all warnings being treated as errors
+```
+
+原因：Nginx 默认开启 `-Werror`，ngx_brotli 内置的 brotli 源码在新版 GCC 下触发 `-Wvla-parameter` 警告（该告警 GCC 11+ 才引入）。
+
+处理：脚本会自动探测编译器；支持时在 `--with-cc-opt` 中加入 `-Wno-error=vla-parameter`。如果使用自定义编译参数，请确保该参数位于 `-Werror` 之后，例如：
+
+```bash
+--with-cc-opt="-O3 -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wno-error=vla-parameter"
+```
+
 ## 升级与校验
 
 ### 升级版本
 
-1. 修改 `nginx-build.env` 中的 `NGINX_VER` / `OPENSSL_VER` / `NGX_BROTLI_REF` 等；
+1. 修改 `env` 中的 `NGINX_VER` / `OPENSSL_VER` / `NGX_BROTLI_REF` 等；
 2. 同步更新对应 SHA256 与 commit pin；
 3. 在测试机重新安装并验证；
 4. 确认 `nginx -V` 输出目标版本与 `built with OpenSSL 3.5.x`。
@@ -460,8 +475,10 @@ sudo /etc/nginx/sbin/nginx -t -e /var/log/nginx/error.log -c /etc/nginx/conf/ngi
 
 | 文件 | 说明 |
 |---|---|
-| [`install_nginx.sh`](./install_nginx.sh) | 一键编译、配置、启动、回滚、卸载 |
-| [`nginx-build.env`](./nginx-build.env) | 供应链校验、版本、域名、证书、限速等变量 |
+| [`install_nginx.sh`](./install_nginx.sh) | 一键编译、配置、启动、回滚、卸载；自动加载同目录 `env` |
+| [`env.example`](./env.example) | 配置模板，复制为 `env` 后修改 |
+| `env` | 用户实际配置（含域名/证书路径，已被 `.gitignore` 忽略） |
+| [`.gitignore`](./.gitignore) | 忽略本地 `env` 与临时文件 |
 | [`project.md`](./project.md) | 设计目标与安全基线 |
 | [`DEPLOYMENT.md`](./DEPLOYMENT.md) | 完整部署、排障与升级手册 |
 | `README.md` | 项目总览与快速使用 |
@@ -470,7 +487,7 @@ sudo /etc/nginx/sbin/nginx -t -e /var/log/nginx/error.log -c /etc/nginx/conf/ngi
 
 - [部署与排障详解](./DEPLOYMENT.md)
 - [设计目标与安全基线](./project.md)
-- [环境变量模板](./nginx-build.env)
+- [配置模板 env.example](./env.example)
 
 ---
 

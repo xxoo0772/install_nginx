@@ -1,19 +1,42 @@
 # Nginx 企业级部署文档
 
 ## 1. 文件说明
-- `/opt/nginx-deploy/install_nginx.sh`：一键编译部署脚本
-- `/opt/nginx-deploy/nginx-build.env`：供应链校验与部署变量
+- `install_nginx.sh`：一键编译部署脚本，自动加载同目录 `env`
+- `env.example`：配置模板，首次使用复制为 `env`
+- `env`：你的实际配置（域名、证书路径等），已被 `.gitignore` 忽略
+- `README.md`：项目总览与快速使用
+- `project.md`：设计目标与安全基线
+- `DEPLOYMENT.md`：本部署手册
 
-> 以上路径为示例。如果你当前工程在其他目录，请替换为实际路径。
+> 以下命令以 `/opt/nginx-deploy` 目录为例。如果你在仓库根目录执行，直接使用 `./install_nginx.sh` 即可。
+
+### 1.1 从 Git 克隆（推荐）
+
+```bash
+git clone <repository-url> nginx-deploy
+cd nginx-deploy
+cp env.example env
+vim env
+```
+
+之后直接执行：
+
+```bash
+sudo ./install_nginx.sh
+```
+
+脚本会自动加载同目录下的 `env`，不需要手动 `source`。
 
 ## 2. 推荐部署前准备
 1. 准备域名与 DNS 解析（主站、WebDAV、API、TUN（Tunnel））
 2. 准备证书与私钥（建议全链证书）
 3. 确认证书 SAN/CN 覆盖全部目标域名（支持通配符），且证书与私钥匹配、未过期
-4. 准备环境变量文件（哈希与 commit pin）
+4. 复制并修改配置文件：`cp env.example env`
 5. 防火墙放行：TCP `443/2096/2099/8443`、UDP `443`（HTTP/3）、以及 stream 分流所需的 TCP 端口
 
-## 3. 环境变量文件示例
+## 3. 配置文件（env）示例
+> 模板见 `env.example`，复制为 `env` 后修改。`env` 是普通 shell 文件，支持变量与引号。
+
 ```bash
 STRICT_SUPPLYCHAIN=1
 # 证书 SAN 严格校验：SAN 未覆盖目标域名时拒绝执行
@@ -82,8 +105,12 @@ CLEAN_BUILD_ARTIFACTS=1
 
 ## 4. 交互式部署（推荐首次）
 ```bash
-# env 中默认 NON_INTERACTIVE=1；交互模式显式覆盖为 0
-sudo bash -c 'set -a; source /opt/nginx-deploy/nginx-build.env; set +a; NON_INTERACTIVE=0 /opt/nginx-deploy/install_nginx.sh'
+# 首次：复制模板并编辑
+cp env.example env
+vim env
+
+# 交互模式会覆盖 env 中的 NON_INTERACTIVE=1
+sudo ./install_nginx.sh --interactive
 ```
 脚本会交互询问：
 - 主站域名
@@ -94,9 +121,10 @@ sudo bash -c 'set -a; source /opt/nginx-deploy/nginx-build.env; set +a; NON_INTE
 
 ## 5. 非交互部署（自动化/批量）
 ```bash
-sudo bash -c 'set -a; source /opt/nginx-deploy/nginx-build.env; set +a; /opt/nginx-deploy/install_nginx.sh'
+sudo ./install_nginx.sh
 ```
 说明：
+- 脚本自动加载同目录 `env`；也可通过 `ENV_FILE=/path/to/env` 指定其他配置文件。
 - 若 `DAV_REUSE_MAIN_CERT=1` 且 `DAV_CERT_SRC/DAV_KEY_SRC` 留空，将自动复用主站证书。
 - 若 `API_REUSE_MAIN_CERT=1` 且 `API_CERT_SRC/API_KEY_SRC` 留空，将自动复用主站证书。
 - 若关闭复用（设为 `0`），则必须显式提供对应证书路径。
@@ -107,15 +135,17 @@ sudo bash -c 'set -a; source /opt/nginx-deploy/nginx-build.env; set +a; /opt/ngi
 
 ## 5.1 干净卸载（高风险操作）
 ```bash
-# 交互确认卸载（推荐）
-sudo /opt/nginx-deploy/install_nginx.sh --uninstall
+# 交互确认卸载（推荐；env 默认 NON_INTERACTIVE=1，需加 --interactive）
+sudo ./install_nginx.sh --uninstall --interactive
 
 # 仅卸载 Nginx，保留网站数据目录 /var/www/*
-sudo /opt/nginx-deploy/install_nginx.sh --uninstall --preserve-www
+sudo ./install_nginx.sh --uninstall --preserve-www --interactive
 
 # 非交互强制卸载（谨慎）
-sudo NON_INTERACTIVE=1 FORCE_UNINSTALL=1 /opt/nginx-deploy/install_nginx.sh --uninstall --yes
+sudo ./install_nginx.sh --uninstall --yes
 ```
+
+> 卸载模式在缺少 `env` 时会使用脚本默认路径继续执行，便于清理残留。
 
 卸载会删除：
 - `/etc/nginx`（配置与二进制）
@@ -232,6 +262,11 @@ sudo tail -n 200 /var/log/nginx/stream_sni.log
 3.3 无 journald 日志
 - Debian 13 最小化系统可能没有 `/dev/log`；脚本会跳过 syslog 通道，仅保留文件日志
 - 如需 journald，确认 `systemd-journald` 正常运行且 `/dev/log` socket 存在
+
+3.4 编译失败：`-Werror=vla-parameter`（ngx_brotli）
+- 现象：编译 brotli 源码时出现 `error: ... [-Werror=vla-parameter]`，随后 `all warnings being treated as errors`
+- 原因：Nginx 默认开启 `-Werror`，新版 GCC 对 brotli 的 VLA 参数声明发出警告（`-Wvla-parameter` 为 GCC 11+ 引入）
+- 处理：脚本会自动探测编译器；支持时在 `--with-cc-opt` 中加入 `-Wno-error=vla-parameter`。如自定义编译参数，请确保该选项位于 `-Werror` 之后
 
 4. Fail2Ban 模板启用（脚本不自动安装 fail2ban）
 ```bash

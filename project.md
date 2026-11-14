@@ -78,6 +78,8 @@
 
 # 产出文件要求
 - 脚本: `install_nginx.sh`
+- 配置模板: `env.example`（用户复制为 `env` 后修改）
+- 本地配置: `env`（不提交，已加入 `.gitignore`）
 - 项目说明: `project.md`
 - 项目总览: `README.md`（GitHub 格式，包含使用方法与文档入口）
 - 部署说明: `DEPLOYMENT.md`（必须包含完整命令示例、交互与非交互用法、常见故障排查）
@@ -86,8 +88,8 @@
 - 一致性保障: 安装流程中断时必须自动回滚（默认启用），避免残留导致重复安装冲突
 
 # 架构与模块说明
-- `install_nginx.sh`: 唯一执行体，负责前置校验 → 参数采集/证书校验 → 备份 → 依赖安装 → 源码校验/编译 → 配置生成 → 服务注册 → 启动 → 清理
-- `nginx-build.env`: 供应链校验值、版本覆盖、域名、证书路径、限流/Fail2Ban 参数
+- `install_nginx.sh`: 唯一执行体，自动加载同目录 `env`，负责前置校验 → 参数采集/证书校验 → 备份 → 依赖安装 → 源码校验/编译 → 配置生成 → 服务注册 → 启动 → 清理
+- `env.example` / `env`: 供应链校验值、版本覆盖、域名、证书路径、限流/Fail2Ban 参数；`env` 为用户本地配置
 - 运行链路: 客户端 → stream TCP SNI 分流（主站/TUN（Tunnel）/web_mux）→ 本地 TLS 终止；HTTP/3 走 UDP 443 直连终止
 - 真实 IP: stream 向下游发送 PROXY protocol，http 层 `real_ip_header proxy_protocol` 还原
 - 模块: `http_ssl/http_v2/http_v3`、`http_realip`、`http_stub_status`、`http_dav` + `dav-ext`、`stream/stream_ssl/stream_ssl_preread`、`ngx_brotli`、`headers-more`、`ngx-fancyindex`、`jemalloc`
@@ -102,3 +104,5 @@
 # 变更记录
 - 2026-11: 增加证书 SAN/有效期/密钥匹配校验；安装前备份与回滚恢复；HTTP/3 QUIC 监听 + Alt-Svc；移除失效的 0-RTT 配置；CSP 去 `unsafe-inline`；开启 OCSP stapling；WebDAV 限速分层；stream 长连接超时；logrotate；`/dev/log` 探测；systemd 额外加固；版本可覆盖与时效性告警。
 - 2026-11: TLS 供应链迁移：quictls（已归档）→ 官方 OpenSSL 3.5.9 LTS；Nginx 升级到 1.31.8；jemalloc 5.4.0；fancyindex 0.6.0；headers-more 0.41；ngx_brotli 固定到 v1.0.0rc commit；新增 commit 精确抓取与回退逻辑。
+- 2026-11: 编译兼容修复：动态探测编译器能力，在支持时于 `--with-cc-opt` 增加 `-Wno-error=vla-parameter`，解决 ngx_brotli 在新版 GCC 下触发 `-Werror=vla-parameter` 导致的编译失败，同时兼容 GCC 10。
+- 2026-11: 配置方式改为模板化：`env.example` 为模板，用户复制为 `env`；脚本自动加载同目录 `env`，新增 `--interactive` 与 `ENV_FILE` 覆盖；`env` 加入 `.gitignore`；支持 `git clone` 后直接 `sudo ./install_nginx.sh`。

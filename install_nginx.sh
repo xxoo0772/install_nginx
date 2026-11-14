@@ -9,6 +9,9 @@
 set -Eeuo pipefail
 umask 027
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/env}"
+
 #================= 版本参数（可用环境变量覆盖，升级时同步更新哈希/commit） =================
 NGINX_VER="${NGINX_VER:-1.31.8}"
 JEMALLOC_VER="${JEMALLOC_VER:-5.4.0}"
@@ -44,7 +47,9 @@ OPENSSL_TARBALL_SHA256="${OPENSSL_TARBALL_SHA256:-}"
 # Git 仓库 commit 固定点（建议生产环境务必填写）
 NGX_BROTLI_COMMIT="${NGX_BROTLI_COMMIT:-}"
 
-THREADS="$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo || echo 1)"
+THREADS="$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)"
+# 编译告警选项（按编译器能力动态探测，兼容 GCC 10 / 11+）
+CC_WARN_OPT=""
 
 #================= 交互输入（可用环境变量预置） =================
 NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
@@ -111,6 +116,44 @@ log_ok()    { echo -e "${GREEN}[成功]${RESET} $*"; }
 log_warn()  { echo -e "${YELLOW}[警告]${RESET} $*"; }
 log_err()   { echo -e "${RED}[错误]${RESET} $*" >&2; }
 
+load_env_file() {
+    local required="${1:-1}"
+    local env_file="${ENV_FILE}"
+
+    if [[ ! -f "${env_file}" ]]; then
+        # 兼容旧文件名（迁移期）
+        if [[ "${env_file}" == "${SCRIPT_DIR}/env" && -f "${SCRIPT_DIR}/nginx-build.env" ]]; then
+            env_file="${SCRIPT_DIR}/nginx-build.env"
+            log_warn "检测到旧版 nginx-build.env，建议执行: mv nginx-build.env env"
+        elif [[ "${required}" == "0" ]]; then
+            log_warn "未找到配置文件 ${env_file}，卸载模式将使用脚本默认值"
+            return 0
+        else
+            log_err "未找到配置文件: ${env_file}"
+            log_err "请先执行: cp ${SCRIPT_DIR}/env.example ${SCRIPT_DIR}/env"
+            log_err "然后编辑 ${SCRIPT_DIR}/env，填入你的域名与证书路径"
+            log_err "也可通过 ENV_FILE=/path/to/env 指定其他配置文件"
+            exit 1
+        fi
+    fi
+
+    local perms
+    perms="$(stat -c '%a' "${env_file}" 2>/dev/null || true)"
+    if [[ -n "${perms}" && "${perms}" =~ [2367]$ ]]; then
+        log_warn "配置文件 ${env_file} 对组或其他用户可写，建议执行: chmod 600 ${env_file}"
+    fi
+
+    log_info "加载配置文件: ${env_file}"
+    set -a
+    # shellcheck disable=SC1090
+    if ! source "${env_file}"; then
+        set +a
+        log_err "配置文件加载失败: ${env_file}"
+        exit 1
+    fi
+    set +a
+}
+
 on_error() {
     local exit_code="$1"
     local line_no="$2"
@@ -159,19 +202,27 @@ parse_args() {
                 PRESERVE_WWW=1
                 shift
                 ;;
+            --interactive)
+                NON_INTERACTIVE=0
+                shift
+                ;;
             --help|-h)
                 cat <<'EOF_HELP'
 Usage:
-  install_nginx.sh                 # 安装/部署模式
+  install_nginx.sh                 # 安装/部署模式（自动加载同目录 env）
+  install_nginx.sh --interactive   # 安装时交互输入缺失参数
   install_nginx.sh --uninstall     # 卸载模式（会删除安装产物）
   install_nginx.sh --uninstall -y  # 非交互强制卸载
   install_nginx.sh --uninstall --preserve-www
+
+Environment:
+  ENV_FILE=/path/to/env            # 指定配置文件（默认：脚本同目录/env）
 EOF_HELP
                 exit 0
                 ;;
             *)
                 log_err "未知参数: $1"
-                log_err "可用参数: --uninstall, --preserve-www, --yes|-y, --help|-h"
+                log_err "可用参数: --interactive, --uninstall, --preserve-www, --yes|-y, --help|-h"
                 exit 1
                 ;;
         esac
@@ -502,6 +553,24 @@ download_sources() {
     log_ok "源码下载完成"
 }
 
+detect_cc_warn_opt() {
+    CC_WARN_OPT=""
+    local cc_version major
+    cc_version="$(cc --version 2>/dev/null || true)"
+    # 仅 GCC 11+ 认识 -Wvla-parameter；GCC 10（Debian 11）不添加该选项
+    if [[ "${cc_version}" != *"Free Software Foundation"* && "${cc_version}" != *"gcc version"* && "${cc_version}" != *"GCC"* ]]; then
+        log_info "非 GCC 编译器，跳过 -Wno-error=vla-parameter"
+        return 0
+    fi
+    major="$(cc -dumpversion 2>/dev/null | cut -d. -f1 || true)"
+    if [[ ! "${major}" =~ ^[0-9]+$ ]] || (( major < 11 )); then
+        log_info "GCC ${major:-unknown} < 11，跳过 -Wno-error=vla-parameter"
+        return 0
+    fi
+    CC_WARN_OPT="-Wno-error=vla-parameter"
+    log_info "GCC ${major} 启用 -Wno-error=vla-parameter（ngx_brotli 兼容）"
+}
+
 compile_jemalloc() {
     log_info "编译并安装 jemalloc"
     cd "${SRC_DIR}/jemalloc-${JEMALLOC_VER}"
@@ -516,6 +585,7 @@ compile_jemalloc() {
 
 compile_nginx() {
     log_info "编译并安装 Nginx"
+    detect_cc_warn_opt
     cd "${SRC_DIR}/nginx-${NGINX_VER}"
 
     # 关键要求：configure 参数必须使用 Bash 数组，避免引号展开问题
@@ -538,7 +608,7 @@ compile_nginx() {
         "--with-stream_ssl_preread_module"
         "--with-openssl=../openssl-${OPENSSL_VER}"
         "--with-ld-opt=-ljemalloc"
-        "--with-cc-opt=-O3 -fstack-protector-strong -D_FORTIFY_SOURCE=2"
+        "--with-cc-opt=-O3 -fstack-protector-strong -D_FORTIFY_SOURCE=2 ${CC_WARN_OPT}"
         "--add-module=../ngx_brotli"
         "--add-module=../headers-more-nginx-module-${HEADERS_MORE_VER}"
         "--add-module=../nginx-dav-ext-module-${DAV_EXT_VER}"
@@ -1458,8 +1528,24 @@ EOF_DONE
 }
 
 main() {
-    parse_args "$@"
+    local arg
+    local need_env=1
+
+    # --help 不需要配置文件；--uninstall 在缺少配置时也可继续
+    for arg in "$@"; do
+        case "${arg}" in
+            --help|-h)
+                parse_args "$@"
+                ;;
+            --uninstall)
+                need_env=0
+                ;;
+        esac
+    done
+
     require_root
+    load_env_file "${need_env}"
+    parse_args "$@"
 
     if [[ "${RUN_MODE}" == "uninstall" ]]; then
         uninstall_nginx_everything
