@@ -8,7 +8,8 @@
 - 证书路径支持模板，按基础域名自动替换，输入域名即可完成配置
 - 单证书：不拷贝证书，所有站点统一引用
 - 默认只启用 main 主站，其他场景提供模板
-- stream SNI 只监听 TCP 443
+- stream SNI 监听 TCP `HTTPS_PORT`（默认 443）
+- 支持 IPv4/IPv6 双栈监听
 - 支持 HTTP/2、HTTP/3、WebDAV、反向代理、安全基线、systemd 沙箱
 - 支持安装前备份、失败回滚、可审计卸载
 
@@ -25,6 +26,8 @@
 - [场景模板](#场景模板)
 - [stream SNI 接入](#stream-sni-接入)
 - [HTTP/3 与端口](#http3-与端口)
+- [HTTP → HTTPS 跳转](#http--https-跳转)
+- [IPv6](#ipv6)
 - [验证](#验证)
 - [卸载](#卸载)
 - [项目结构](#项目结构)
@@ -38,7 +41,9 @@
 - **供应链校验**：HTTPS、SHA256、Git commit pin。
 - **单证书**：安装时指定一次，所有站点和模板统一引用。
 - **默认交互**：先询问基础域名，再输入主站子域名；证书路径按模板自动生成。
-- **stream SNI**：默认只监听 443，分流到 main 后端。
+- **stream SNI**：监听 `HTTPS_PORT`，分流到 main 后端。
+- **IPv6**：外部监听默认 IPv4/IPv6 双栈，可选内部 IPv6 回环。
+- **HTTP 跳转**：支持 `main`、`base`、`list`、`all` 四种模式。
 - **场景模板**：`ws`、`webdav`、`reverse-proxy`。
 - **安全基线**：TLS 1.2/1.3、ECDHE、HSTS、CSP、OCSP 自动判断。
 - **systemd 沙箱**：最小能力集、`ProtectSystem=strict` 等。
@@ -109,8 +114,23 @@ SSL_KEY_PATH_TPL="/etc/letsencrypt/__BASE_DOMAIN__/__BASE_DOMAIN__.key"
 SSL_CERT_PATH=""
 SSL_KEY_PATH=""
 
+# 对外 HTTPS/TLS 端口与 HTTP 跳转源端口
+HTTPS_PORT="443"
+HTTP_REDIRECT_PORT="80"
+
+# HTTP → HTTPS 跳转
 HTTP_REDIRECT="1"
+HTTP_REDIRECT_MODE="main"        # main / base / list / all
+HTTP_REDIRECT_DOMAINS=""         # list 模式使用，空格分隔
+
+# 内部回环地址与端口
 MAIN_BACKEND_PORT="1111"
+MAIN_BACKEND_ADDR="127.0.0.1"    # IPv6 使用 "[::1]"
+
+# IPv6 双栈监听
+IPV6_ENABLE="1"
+
+# HTTP/3
 HTTP3_ENABLE="0"
 HTTP3_PORT="443"
 OCSP_STAPLING="auto"
@@ -125,7 +145,7 @@ F2B_BANTIME="12h"
 F2B_IGNOREIP="127.0.0.1/8 ::1"
 ```
 
-修改版本时，只需编辑版本号和对应 SHA256 / commit pin。
+版本号与对应 SHA256 / commit pin 集中维护。
 
 ## 交互安装
 
@@ -142,9 +162,12 @@ sudo ./install_nginx.sh
 [3/17] 采集域名与证书参数
   请输入基础域名（例如 abc.com）: abc.com
   请输入主站子域名（例如 main，最终为 main.abc.com；输入 @ 使用 abc.com）: main
+  请输入对外 HTTPS 端口 [443]: 443
   请输入证书路径（回车使用默认值）: /etc/letsencrypt/abc.com/fullchain.cer
   请输入私钥路径（回车使用默认值）: /etc/letsencrypt/abc.com/abc.com.key
-  是否生成 80 → 443 跳转？ [Y/n]
+  是否生成 HTTP → HTTPS 跳转？ [Y/n] y
+  跳转模式 main/base/list/all [main]: main
+  HTTP 跳转源端口 [80]: 80
 [4/17] 校验证书
 ...
 ```
@@ -160,6 +183,9 @@ sudo ./install_nginx.sh
 NON_INTERACTIVE="1"
 BASE_DOMAIN="abc.com"
 MAIN_SUBDOMAIN="main"
+HTTPS_PORT="443"
+HTTP_REDIRECT_MODE="main"
+IPV6_ENABLE="1"
 # 留空时按模板自动生成：
 #   /etc/letsencrypt/abc.com/fullchain.cer
 #   /etc/letsencrypt/abc.com/abc.com.key
@@ -189,18 +215,19 @@ sudo ./install_nginx.sh --non-interactive
                          ┌──────────────────────────────────────────────┐
                          │                   Nginx                      │
 Client                   │                                              │
-  │  TCP 443 ───────────►│  stream: ssl_preread + PROXY protocol        │
-  │                      │      ├─ <主域名> ─► 127.0.0.1:1111 (main)     │
-  │                      │      └─ default  ─► 127.0.0.1:1111 (main)     │
+  │  TCP HTTPS_PORT ────►│  stream: ssl_preread + PROXY protocol        │
+  │                      │      ├─ <主域名> ─► MAIN_BACKEND_ADDR:1111    │
+  │                      │      └─ default  ─► MAIN_BACKEND_ADDR:1111    │
   │                      │                                              │
-  │  UDP 443 ───────────►│  http/3 (QUIC) 直接终止 TLS（可关闭/改端口）  │
+  │  UDP HTTP3_PORT ────►│  http/3 (QUIC) 直接终止 TLS（可关闭/改端口）  │
   │                      │      └─ main 主站                            │
-  │  TCP 80  ───────────►│  301 → HTTPS（可关闭）                        │
+  │  TCP HTTP_REDIRECT_PORT ► 301 → HTTPS（可关闭/多模式）               │
                          └──────────────────────────────────────────────┘
 ```
 
 - 默认只有 `main` 主站生效。
 - 其他场景通过模板复制并修改。
+- 外部监听默认同时生成 IPv4 和 IPv6。
 - 证书统一来自 `/etc/nginx/snippets/ssl.conf`。
 
 ## 安装后目录
@@ -281,9 +308,16 @@ vim /etc/nginx/conf.d/ws.conf
 修改：
 
 1. `server_name`
-2. `listen 127.0.0.1:<内部端口>`
+2. `listen 127.0.0.1:<内部端口>`（内部 IPv6 改为 `[::1]`）
 3. `proxy_pass` 或 `root`
-4. 日志、超时、上传大小等
+4. 日志、超时、上传大小、缓冲区等
+
+模板中的职责划分：
+
+- `snippets/ssl.conf`：证书、私钥、信任链
+- `snippets/proxy-common.conf`：HTTP/1.1、转发头、`proxy_redirect off`
+- `snippets/websocket.conf`：Upgrade/Connection、关闭缓冲、上游长连接，需在 `proxy-common.conf` 之后 include
+- 超时、缓冲区、请求体大小：在各站点模板中独立配置
 
 ## stream SNI 接入
 
@@ -296,10 +330,12 @@ ws.example.com ws_backend;
 # upstream 区域
 upstream ws_backend {
     server 127.0.0.1:12001;
+    # 内部 IPv6 使用：
+    # server [::1]:12001;
 }
 ```
 
-端口必须与模板中的 `listen` 一致。
+端口必须与模板中的 `listen` 一致。模板内部使用 `[::1]` 时，upstream 也要使用 `[::1]`。
 
 ```bash
 nginx -t && systemctl reload nginx
@@ -312,11 +348,48 @@ HTTP3_ENABLE="0"
 HTTP3_PORT="443"
 ```
 
-- 默认 `HTTP3_ENABLE="0"`：不监听 UDP，避免与其他服务抢占 UDP/443。
+- 默认 `HTTP3_ENABLE="0"`：不监听 UDP，避免与其他服务抢占 UDP 端口。
 - `HTTP3_ENABLE="1"`：启用 QUIC，额外监听 UDP 端口。
 - `HTTP3_PORT="8443"`：QUIC 改用 UDP 8443，`Alt-Svc` 自动跟随。
 - 安装前检查目标 UDP 端口占用。
-- 若其他 QUIC 应用占用 443/udp，可关闭 Nginx HTTP/3 或改用其他端口。
+- 若其他 QUIC 应用占用目标 UDP 端口，可关闭 Nginx HTTP/3 或改用其他端口。
+
+## HTTP → HTTPS 跳转
+
+```bash
+HTTPS_PORT="443"
+HTTP_REDIRECT="1"
+HTTP_REDIRECT_PORT="80"
+HTTP_REDIRECT_MODE="main"
+HTTP_REDIRECT_DOMAINS=""
+```
+
+模式：
+
+| 模式 | 行为 |
+|---|---|
+| `main` | 仅主站域名跳转，其他 Host 返回 444 |
+| `base` | 基础域名 + 主站域名跳转，其他 Host 返回 444 |
+| `list` | `HTTP_REDIRECT_DOMAINS` 中的域名跳转，其他 Host 返回 444 |
+| `all` | 所有 Host 跳转到同名 HTTPS |
+
+- `HTTPS_PORT` 非 443 时，跳转目标自动追加端口，例如 `https://main.abc.com:8443/...`。
+- `HTTP_REDIRECT="0"` 时不生成跳转文件。
+- `main/base/list` 会生成 `default_server` 兜底并返回 444，避免误跳转。
+- `all` 模式使用 `$host`，只在明确接管 HTTP 源端口时使用。
+
+## IPv6
+
+```bash
+IPV6_ENABLE="1"
+MAIN_BACKEND_ADDR="127.0.0.1"
+```
+
+- `IPV6_ENABLE="1"`：stream、HTTP 跳转、HTTP/3 同时监听 IPv4 和 IPv6。
+- 所有 IPv6 监听显式使用 `ipv6only=on`。
+- 外部 IPv6 客户端默认经 stream 转发到 `MAIN_BACKEND_ADDR` 指定的内部回环地址。
+- 需要内部 IPv6 时，将 `MAIN_BACKEND_ADDR` 改为 `"[::1]"`。
+- 模板中的内部监听可按注释改为 `[::1]`，并同步修改 `stream_sni.conf` 的 upstream。
 
 ## 验证
 
@@ -324,8 +397,11 @@ HTTP3_PORT="443"
 sudo /etc/nginx/sbin/nginx -t
 sudo systemctl status nginx --no-pager
 /etc/nginx/sbin/nginx -V 2>&1 | head -5
-curl -kI https://main.abc.com/healthz
-curl --http3 -sI https://main.abc.com/healthz
+curl -kI https://main.abc.com:443/healthz
+curl -kI --resolve main.abc.com:443:127.0.0.1 https://main.abc.com:443/healthz
+curl -6 -kI --resolve main.abc.com:443:[::1] https://main.abc.com:443/healthz
+curl -I http://main.abc.com/
+curl --http3 -sI https://main.abc.com:443/healthz
 sudo tail -n 100 /var/log/nginx/stream_sni.log
 sudo ss -lntup | grep nginx
 ```

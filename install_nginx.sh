@@ -4,8 +4,9 @@
 # 企业级 Nginx 源码编译部署脚本
 # - 单文件、无 env 依赖
 # - 单证书、不拷贝证书；证书路径支持按域名模板自动替换
-# - stream SNI 只监听 TCP 443，默认只启用 main 主站
-# - HTTP/3 默认关闭，避免与其他服务抢占 UDP/443
+# - stream SNI 监听 TCP HTTPS_PORT（默认 443），默认只启用 main 主站
+# - HTTP/3 默认关闭，避免与其他服务抢占 UDP 端口
+# - HTTP→HTTPS 跳转支持 main/base/list/all 模式
 # - 场景模板安装到 conf.d/*.conf.example
 # - 默认交互：先询问基础域名，再输入主站子域名
 #====================================================
@@ -26,7 +27,7 @@ DAV_EXT_VER="3.0.0"
 HEADERS_MORE_VER="0.41"
 NGX_BROTLI_REF="v1.0.0rc"
 
-# ---------- 组件校验值（换版本时同步更新） ----------
+# ---------- 组件校验值（版本与校验值需保持一致） ----------
 # Nginx
 NGINX_TARBALL_SHA256="0652b760b3b772d2ec17b47c2fc15d9a95e6fe35cd5b877eadc1a62d9bc75af1"
 # OpenSSL
@@ -78,14 +79,35 @@ SSL_KEY_PATH_TPL="/etc/letsencrypt/__BASE_DOMAIN__/__BASE_DOMAIN__.key"
 SSL_CERT_PATH=""
 SSL_KEY_PATH=""
 
-# 1=生成 80 → 443 跳转
+# ---------- 监听端口 ----------
+# 对外 HTTPS/TLS 端口：stream 监听该端口，HTTP 跳转也指向该端口
+HTTPS_PORT="443"
+# HTTP 源端口：HTTP_REDIRECT=1 时监听该端口
+HTTP_REDIRECT_PORT="80"
+
+# HTTP → HTTPS 跳转
+# 0=关闭；1=按 HTTP_REDIRECT_MODE 生成
 HTTP_REDIRECT="1"
+# 跳转模式：
+#   main=仅主站域名
+#   base=基础域名 + 主站域名
+#   list=HTTP_REDIRECT_DOMAINS 中列出的域名
+#   all=所有域名（default_server）
+HTTP_REDIRECT_MODE="main"
+# list 模式域名列表，空格分隔，例如 "abc.com www.abc.com api.abc.com"
+HTTP_REDIRECT_DOMAINS=""
+
 # main 站点内部监听端口（仅本机回环，不可使用 80/443）
 MAIN_BACKEND_PORT="1111"
+# 内部回环地址：IPv4 使用 127.0.0.1；IPv6 使用 "[::1]"
+MAIN_BACKEND_ADDR="127.0.0.1"
 
-# HTTP/3：默认关闭，避免与其他服务抢占 UDP/443
-# 0=关闭（推荐，仅使用 TCP 443 + HTTP/2）
-# 1=启用（会额外监听 UDP 443；如冲突请修改 HTTP3_PORT）
+# IPv6：1=同时监听 IPv4/IPv6；0=仅监听 IPv4
+IPV6_ENABLE="1"
+
+# HTTP/3：默认关闭，避免与其他服务抢占 UDP 端口
+# 0=关闭（推荐，仅使用 TCP + HTTP/2）
+# 1=启用（会额外监听 UDP HTTP3_PORT；如冲突请修改 HTTP3_PORT）
 HTTP3_ENABLE="0"
 HTTP3_PORT="443"
 # OCSP：auto/on/off
@@ -133,6 +155,10 @@ THREADS="$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null |
 # 再通过 apply_placeholders() 替换到生成的 Nginx 配置模板中。
 # 这样同一份模板既能带中文注释，又能按需开关 HTTP/3、OCSP 等功能。
 #
+# stream 对外监听 IPv6 行：IPV6_ENABLE=1 时生成，否则为空
+STREAM_LISTEN_V6_LINE=""
+# 真实 IP 的 IPv6 回环来源行：IPV6_ENABLE=1 时生成
+REALIP_V6_LINE=""
 # HTTP/3 监听行：启用时形如 "listen 443 quic;"，关闭时为空字符串（不渲染）
 HTTP3_LISTEN_V4=""
 HTTP3_LISTEN_V6=""
@@ -362,7 +388,8 @@ resolve_cert_paths_from_template() {
 }
 
 validate_settings() {
-    local name port
+    local name port domain
+    local -a redirect_domains=()
 
     if [[ "${NON_INTERACTIVE}" != "0" && "${NON_INTERACTIVE}" != "1" ]]; then
         ui_err "NON_INTERACTIVE 只能是 0 或 1"
@@ -372,20 +399,58 @@ validate_settings() {
         ui_err "HTTP_REDIRECT 只能是 0 或 1"
         exit 1
     fi
+    if [[ "${IPV6_ENABLE}" != "0" && "${IPV6_ENABLE}" != "1" ]]; then
+        ui_err "IPV6_ENABLE 只能是 0 或 1"
+        exit 1
+    fi
     if [[ "${HTTP3_ENABLE}" != "0" && "${HTTP3_ENABLE}" != "1" ]]; then
         ui_err "HTTP3_ENABLE 只能是 0 或 1"
         exit 1
     fi
-    for name in HTTP3_PORT MAIN_BACKEND_PORT; do
+    case "${HTTP_REDIRECT_MODE}" in
+        main|base|list|all) ;;
+        *)
+            ui_err "HTTP_REDIRECT_MODE 只能是 main/base/list/all，当前: ${HTTP_REDIRECT_MODE}"
+            exit 1
+            ;;
+    esac
+    for name in HTTPS_PORT HTTP_REDIRECT_PORT HTTP3_PORT MAIN_BACKEND_PORT; do
         port="${!name}"
         if [[ ! "${port}" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
             ui_err "${name} 必须是 1-65535，当前: ${port}"
             exit 1
         fi
     done
-    if [[ "${MAIN_BACKEND_PORT}" == "443" || "${MAIN_BACKEND_PORT}" == "80" ]]; then
-        ui_err "MAIN_BACKEND_PORT 不能是 443 或 80"
+    if [[ "${HTTPS_PORT}" == "${HTTP_REDIRECT_PORT}" ]]; then
+        ui_err "HTTPS_PORT 不能与 HTTP_REDIRECT_PORT 相同"
         exit 1
+    fi
+    if [[ "${MAIN_BACKEND_PORT}" == "443" || "${MAIN_BACKEND_PORT}" == "80" \
+        || "${MAIN_BACKEND_PORT}" == "${HTTPS_PORT}" \
+        || "${MAIN_BACKEND_PORT}" == "${HTTP_REDIRECT_PORT}" ]]; then
+        ui_err "MAIN_BACKEND_PORT 不能是 80、443、HTTPS_PORT 或 HTTP_REDIRECT_PORT"
+        exit 1
+    fi
+    if [[ -z "${MAIN_BACKEND_ADDR}" || "${MAIN_BACKEND_ADDR}" =~ [[:space:]] ]]; then
+        ui_err "MAIN_BACKEND_ADDR 不能为空且不能包含空白字符"
+        exit 1
+    fi
+    if [[ "${MAIN_BACKEND_ADDR}" == *:* && "${MAIN_BACKEND_ADDR}" != \[*\] ]]; then
+        ui_err 'MAIN_BACKEND_ADDR 的 IPv6 地址需使用 "[::1]" 形式'
+        exit 1
+    fi
+    if [[ "${HTTP_REDIRECT}" == "1" && "${HTTP_REDIRECT_MODE}" == "list" ]]; then
+        read -r -a redirect_domains <<< "${HTTP_REDIRECT_DOMAINS}"
+        if (( ${#redirect_domains[@]} == 0 )); then
+            ui_err "HTTP_REDIRECT_MODE=list 时必须填写 HTTP_REDIRECT_DOMAINS"
+            exit 1
+        fi
+        for domain in "${redirect_domains[@]}"; do
+            if [[ ! "${domain}" =~ ^[A-Za-z0-9.-]+$ ]]; then
+                ui_err "HTTP_REDIRECT_DOMAINS 中存在非法域名: ${domain}"
+                exit 1
+            fi
+        done
     fi
     if [[ "${OCSP_STAPLING}" != "auto" && "${OCSP_STAPLING}" != "on" && "${OCSP_STAPLING}" != "off" ]]; then
         ui_err "OCSP_STAPLING 只能是 auto/on/off"
@@ -494,8 +559,8 @@ check_http3_port_available() {
 check_tcp_ports_available() {
     command -v ss >/dev/null 2>&1 || return 0
 
-    local ports=(443 "${MAIN_BACKEND_PORT}")
-    [[ "${HTTP_REDIRECT}" == "1" ]] && ports+=(80)
+    local ports=("${HTTPS_PORT}" "${MAIN_BACKEND_PORT}")
+    [[ "${HTTP_REDIRECT}" == "1" ]] && ports+=("${HTTP_REDIRECT_PORT}")
 
     local port out
     for port in "${ports[@]}"; do
@@ -504,7 +569,7 @@ check_tcp_ports_available() {
         if printf '%s\n' "${out}" | grep -qv 'nginx'; then
             ui_err "TCP/${port} 已被非 Nginx 进程占用："
             printf '%s\n' "${out}" | sed 's/^/[tcp] /' >&2
-            ui_err "请释放该端口，或调整 MAIN_BACKEND_PORT / HTTP_REDIRECT"
+            ui_err "请释放该端口，或调整 HTTPS_PORT / HTTP_REDIRECT_PORT / MAIN_BACKEND_PORT"
             exit 1
         fi
     done
@@ -513,8 +578,8 @@ check_tcp_ports_available() {
 ensure_ports_free_or_exit() {
     command -v ss >/dev/null 2>&1 || return 0
 
-    local ports=(443 "${MAIN_BACKEND_PORT}")
-    [[ "${HTTP_REDIRECT}" == "1" ]] && ports+=(80)
+    local ports=("${HTTPS_PORT}" "${MAIN_BACKEND_PORT}")
+    [[ "${HTTP_REDIRECT}" == "1" ]] && ports+=("${HTTP_REDIRECT_PORT}")
 
     local port out
     for port in "${ports[@]}"; do
@@ -666,7 +731,13 @@ collect_main_inputs() {
     fi
     validate_domain_or_exit "${PRIMARY_DOMAIN}" "主站域名"
 
-    # 3) 证书路径：优先使用脚本顶部模板自动生成，用户可直接回车采用默认值
+    # 3) 对外 HTTPS 端口
+    if [[ "${NON_INTERACTIVE}" != "1" ]]; then
+        value="$(prompt_value "请输入对外 HTTPS 端口" "${HTTPS_PORT}")"
+        HTTPS_PORT="${value:-${HTTPS_PORT}}"
+    fi
+
+    # 4) 证书路径：优先使用脚本顶部模板自动生成，用户可直接回车采用默认值
     resolve_cert_paths_from_template
 
     local cert_default="${SSL_CERT_PATH:-}"
@@ -732,8 +803,16 @@ collect_main_inputs() {
     if [[ "${NON_INTERACTIVE}" != "1" ]]; then
         local default="N"
         [[ "${HTTP_REDIRECT}" == "1" ]] && default="Y"
-        if prompt_yes_no "是否生成 80 → 443 跳转？" "${default}"; then
+        if prompt_yes_no "是否生成 HTTP → HTTPS 跳转？" "${default}"; then
             HTTP_REDIRECT=1
+            value="$(prompt_value "跳转模式 main/base/list/all" "${HTTP_REDIRECT_MODE}")"
+            HTTP_REDIRECT_MODE="${value:-${HTTP_REDIRECT_MODE}}"
+            if [[ "${HTTP_REDIRECT_MODE}" == "list" ]]; then
+                value="$(prompt_value "跳转域名列表（空格分隔）" "${HTTP_REDIRECT_DOMAINS}")"
+                HTTP_REDIRECT_DOMAINS="${value:-${HTTP_REDIRECT_DOMAINS}}"
+            fi
+            value="$(prompt_value "HTTP 跳转源端口" "${HTTP_REDIRECT_PORT}")"
+            HTTP_REDIRECT_PORT="${value:-${HTTP_REDIRECT_PORT}}"
         else
             HTTP_REDIRECT=0
         fi
@@ -951,6 +1030,15 @@ generate_dhparam() {
 }
 
 prepare_config_values() {
+    STREAM_LISTEN_V6_LINE=""
+    REALIP_V6_LINE=""
+    if [[ "${IPV6_ENABLE}" == "1" ]]; then
+        STREAM_LISTEN_V6_LINE="listen [::]:${HTTPS_PORT} reuseport ipv6only=on;"
+    fi
+    if [[ "${IPV6_ENABLE}" == "1" || "${MAIN_BACKEND_ADDR}" == "[::1]" ]]; then
+        REALIP_V6_LINE="set_real_ip_from ::1;"
+    fi
+
     HTTP3_LISTEN_V4=""
     HTTP3_LISTEN_V6=""
     HTTP3_ON_LINE=""
@@ -959,7 +1047,9 @@ prepare_config_values() {
     HTTP3_COMMENT_LINE="# HTTP/3 未启用（默认），不监听 UDP，避免与其他 QUIC 服务抢占端口"
     if [[ "${HTTP3_ENABLE}" == "1" ]]; then
         HTTP3_LISTEN_V4="listen ${HTTP3_PORT} quic;"
-        HTTP3_LISTEN_V6="listen [::]:${HTTP3_PORT} quic;"
+        if [[ "${IPV6_ENABLE}" == "1" ]]; then
+            HTTP3_LISTEN_V6="listen [::]:${HTTP3_PORT} quic ipv6only=on;"
+        fi
         HTTP3_ON_LINE="http3 on;"
         QUIC_RETRY_LINE="quic_retry on;"
         ALT_SVC_LINE="add_header Alt-Svc 'h3=\":${HTTP3_PORT}\"; ma=86400' always;"
@@ -997,10 +1087,14 @@ prepare_config_values() {
 
 apply_placeholders() {
     local file="$1"
-    local esc_pd esc_mp esc_cert esc_key esc_v4 esc_v6 esc_h3 esc_qr esc_h3c esc_alt esc_stap esc_stapv esc_sysa esc_syse
+    local esc_pd esc_mp esc_mba esc_https esc_sv6 esc_rv6 esc_cert esc_key esc_v4 esc_v6 esc_h3 esc_qr esc_h3c esc_alt esc_stap esc_stapv esc_sysa esc_syse
 
     esc_pd="$(escape_sed_replacement "${PRIMARY_DOMAIN}")"
     esc_mp="$(escape_sed_replacement "${MAIN_BACKEND_PORT}")"
+    esc_mba="$(escape_sed_replacement "${MAIN_BACKEND_ADDR}")"
+    esc_https="$(escape_sed_replacement "${HTTPS_PORT}")"
+    esc_sv6="$(escape_sed_replacement "${STREAM_LISTEN_V6_LINE}")"
+    esc_rv6="$(escape_sed_replacement "${REALIP_V6_LINE}")"
     esc_cert="$(escape_sed_replacement "${SSL_CERT_PATH}")"
     esc_key="$(escape_sed_replacement "${SSL_KEY_PATH}")"
     esc_v4="$(escape_sed_replacement "${HTTP3_LISTEN_V4}")"
@@ -1017,6 +1111,10 @@ apply_placeholders() {
     local tmp="${file}.tmp.$$"
     sed -e "s|__PRIMARY_DOMAIN__|${esc_pd}|g" \
         -e "s|__MAIN_BACKEND_PORT__|${esc_mp}|g" \
+        -e "s|__MAIN_BACKEND_ADDR__|${esc_mba}|g" \
+        -e "s|__HTTPS_PORT__|${esc_https}|g" \
+        -e "s|__STREAM_LISTEN_V6__|${esc_sv6}|g" \
+        -e "s|__REALIP_V6_LINE__|${esc_rv6}|g" \
         -e "s|__SSL_CERT_PATH__|${esc_cert}|g" \
         -e "s|__SSL_KEY_PATH__|${esc_key}|g" \
         -e "s|__HTTP3_LISTEN_V4__|${esc_v4}|g" \
@@ -1069,8 +1167,8 @@ events {
 }
 
 # ============================================================
-# stream 四层代理：TCP 443 按 SNI 分流到不同后端
-# - 仅监听 TCP 443，不占用 UDP
+# stream 四层代理：TCP __HTTPS_PORT__ 按 SNI 分流到不同后端
+# - 仅监听 TCP __HTTPS_PORT__，不占用 UDP
 # - 具体域名映射见 /etc/nginx/stream.conf.d/stream_sni.conf
 # ============================================================
 stream {
@@ -1098,7 +1196,7 @@ http {
     # stream 层已开启 proxy_protocol，这里从 PROXY 协议头还原客户端 IP
     real_ip_header proxy_protocol;
     set_real_ip_from 127.0.0.1;
-    set_real_ip_from ::1;
+    __REALIP_V6_LINE__
     real_ip_recursive on;
 
     # ---------- 日志 ----------
@@ -1260,8 +1358,10 @@ EOF_SSL
 # ============================================================
 # 反向代理公共配置
 #
-# 作用：统一设置代理协议版本、转发头与超时时间
+# 作用：统一设置代理协议版本与转发头
 # 用法：在 location 中 include /etc/nginx/snippets/proxy-common.conf;
+#
+# 超时、缓冲区、请求体大小属于场景差异项，在站点模板中单独配置
 # ============================================================
 
 # 与上游服务使用 HTTP/1.1，兼容长连接与 WebSocket
@@ -1273,30 +1373,31 @@ proxy_set_header X-Real-IP         $remote_addr;
 proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto $scheme;
 
-# 与上游建立连接、读取、发送的超时时间
-proxy_connect_timeout 10s;
-proxy_read_timeout    60s;
-proxy_send_timeout    60s;
+# 上游返回的重定向不自动改写
+proxy_redirect off;
 EOF_PROXY_COMMON
     chmod 644 "${NGINX_SNIPPET_DIR}/proxy-common.conf"
 
     cat > "${NGINX_SNIPPET_DIR}/websocket.conf" <<'EOF_WS_SNIPPET'
 # ============================================================
-# WebSocket / 长连接升级配置
+# WebSocket / 长连接协议切换配置
 #
-# 用法：仅需 WebSocket 的 location 中 include 本文件
+# 用法：在 location 中先 include proxy-common.conf，再 include 本文件
+#       include /etc/nginx/snippets/proxy-common.conf;
 #       include /etc/nginx/snippets/websocket.conf;
+#
+# proxy-common.conf 已提供 proxy_http_version 1.1
 # ============================================================
 
-# WebSocket 依赖 HTTP/1.1 的 Upgrade 机制
-proxy_http_version 1.1;
-
-# 传递升级头，完成协议切换
+# 传递协议切换头
 proxy_set_header Upgrade    $http_upgrade;
 proxy_set_header Connection "upgrade";
 
 # 关闭代理缓冲，降低长连接消息延迟
 proxy_buffering off;
+
+# 保持与上游的长连接
+proxy_socket_keepalive on;
 EOF_WS_SNIPPET
     chmod 644 "${NGINX_SNIPPET_DIR}/websocket.conf"
 }
@@ -1308,9 +1409,9 @@ write_main_site() {
 # 主站（main）配置（由 install_nginx.sh 自动生成）
 #
 # 架构说明：
-#   - 外部客户端先连接 stream 层的 TCP 443（见 stream_sni.conf）
+#   - 外部客户端先连接 stream 层的 TCP __HTTPS_PORT__（见 stream_sni.conf）
 #   - stream 层按 SNI 将流量转发到本文件监听的内部回环端口
-#   - 本文件只监听 127.0.0.1，不直接暴露到公网
+#   - 本文件只监听 __MAIN_BACKEND_ADDR__，不直接暴露到公网
 #
 # 当前主站域名：__PRIMARY_DOMAIN__
 # 证书配置：由 /etc/nginx/snippets/ssl.conf 统一提供
@@ -1320,11 +1421,10 @@ server {
     # 仅绑定本机回环地址，端口由脚本 MAIN_BACKEND_PORT 决定
     # ssl：在此层完成 TLS 终止
     # proxy_protocol：接收 stream 层传来的真实客户端 IP
-    listen 127.0.0.1:__MAIN_BACKEND_PORT__ ssl proxy_protocol;
+    listen __MAIN_BACKEND_ADDR__:__MAIN_BACKEND_PORT__ ssl proxy_protocol;
 
-    # ---------- HTTP/3 / QUIC 监听（默认关闭） ----------
-    # 开启后会额外监听 UDP 端口，可能与其它 QUIC 服务冲突
-    # 如需启用：在脚本顶部设置 HTTP3_ENABLE="1"
+    # ---------- HTTP/3 / QUIC 监听 ----------
+    # 由脚本顶部 HTTP3_ENABLE 控制；开启后会额外监听 UDP 端口
     __HTTP3_COMMENT_LINE__
     __HTTP3_LISTEN_V4__
     __HTTP3_LISTEN_V6__
@@ -1349,6 +1449,10 @@ server {
     root /var/www/html;
     index index.html index.htm;
 
+    # ---------- 请求体大小 ----------
+    # 静态站点通常无需上传，按需调整
+    client_max_body_size 10m;
+
     # ---------- 日志 ----------
     access_log /var/log/nginx/main_access.log;
     error_log  /var/log/nginx/main_error.log;
@@ -1368,6 +1472,7 @@ server {
 
     # ---------- 可选：静态资源缓存 ----------
     # 启用后可减少重复请求，按需取消注释
+    # 注意：location 内一旦使用 add_header，会覆盖 http 层安全响应头
     # location ~* \.(css|js|jpg|jpeg|png|gif|svg|ico|woff2?)$ {
     #     expires 30d;
     #     add_header Cache-Control "public, max-age=2592000";
@@ -1380,31 +1485,89 @@ EOF_MAIN
 }
 
 write_redirect_site() {
-    if [[ "${HTTP_REDIRECT}" == "1" ]]; then
-        cat > "${NGINX_CONF_DIR}/redirect-http.conf" <<'EOF_REDIRECT'
+    if [[ "${HTTP_REDIRECT}" != "1" ]]; then
+        rm -f "${NGINX_CONF_DIR}/redirect-http.conf"
+        return
+    fi
+
+    local suffix=""
+    [[ "${HTTPS_PORT}" != "443" ]] && suffix=":${HTTPS_PORT}"
+
+    local listen_v4_line="    listen ${HTTP_REDIRECT_PORT};"
+    local listen_v6_line=""
+    if [[ "${IPV6_ENABLE}" == "1" ]]; then
+        listen_v6_line="    listen [::]:${HTTP_REDIRECT_PORT} ipv6only=on;"
+    fi
+
+    local server_name=""
+    local return_line=""
+
+    case "${HTTP_REDIRECT_MODE}" in
+        main)
+            server_name="${PRIMARY_DOMAIN}"
+            return_line="    return 301 https://${PRIMARY_DOMAIN}${suffix}\$request_uri;"
+            ;;
+        base)
+            if [[ "${BASE_DOMAIN}" == "${PRIMARY_DOMAIN}" ]]; then
+                server_name="${BASE_DOMAIN}"
+            else
+                server_name="${BASE_DOMAIN} ${PRIMARY_DOMAIN}"
+            fi
+            return_line="    return 301 https://\$host${suffix}\$request_uri;"
+            ;;
+        list)
+            server_name="${HTTP_REDIRECT_DOMAINS}"
+            return_line="    return 301 https://\$host${suffix}\$request_uri;"
+            ;;
+        all)
+            listen_v4_line="    listen ${HTTP_REDIRECT_PORT} default_server;"
+            if [[ "${IPV6_ENABLE}" == "1" ]]; then
+                listen_v6_line="    listen [::]:${HTTP_REDIRECT_PORT} default_server ipv6only=on;"
+            fi
+            server_name="_"
+            return_line="    return 301 https://\$host${suffix}\$request_uri;"
+            ;;
+    esac
+
+    local default_block=""
+    if [[ "${HTTP_REDIRECT_MODE}" != "all" ]]; then
+        local default_v6_line=""
+        if [[ "${IPV6_ENABLE}" == "1" ]]; then
+            default_v6_line="    listen [::]:${HTTP_REDIRECT_PORT} default_server ipv6only=on;"
+        fi
+        default_block=$(cat <<EOF_DEFAULT
+
+# 未匹配域名兜底：直接断开，避免误跳转
+server {
+    listen ${HTTP_REDIRECT_PORT} default_server;
+${default_v6_line}
+    server_name _;
+    return 444;
+}
+EOF_DEFAULT
+)
+    fi
+
+    cat > "${NGINX_CONF_DIR}/redirect-http.conf" <<EOF_REDIRECT
 # ============================================================
 # HTTP → HTTPS 跳转（由 install_nginx.sh 自动生成）
 #
-# 作用：监听 TCP 80，将所有 HTTP 请求永久重定向到 HTTPS
+# 模式：${HTTP_REDIRECT_MODE}
+# 源端口：${HTTP_REDIRECT_PORT}
+# 目标端口：${HTTPS_PORT}
 # 关闭方式：脚本顶部设置 HTTP_REDIRECT="0"
 # ============================================================
 server {
-    # 同时监听 IPv4 与 IPv6 的 80 端口
-    listen 80;
-    listen [::]:80;
-
-    # 仅对主站域名生效
-    server_name __PRIMARY_DOMAIN__;
+${listen_v4_line}
+${listen_v6_line}
+    server_name ${server_name};
 
     # 301 永久跳转，保留原始路径与查询参数
-    return 301 https://$host$request_uri;
+${return_line}
 }
+${default_block}
 EOF_REDIRECT
-        apply_placeholders "${NGINX_CONF_DIR}/redirect-http.conf"
-        chmod 640 "${NGINX_CONF_DIR}/redirect-http.conf"
-    else
-        rm -f "${NGINX_CONF_DIR}/redirect-http.conf"
-    fi
+    chmod 640 "${NGINX_CONF_DIR}/redirect-http.conf"
 }
 
 write_stream_sni() {
@@ -1414,7 +1577,7 @@ write_stream_sni() {
 # stream SNI 分流配置（由 install_nginx.sh 自动生成）
 #
 # 作用：
-#   - 仅监听 TCP 443（不占用 UDP 443）
+#   - 仅监听 TCP __HTTPS_PORT__（不占用 UDP）
 #   - 在 TLS 握手前读取 SNI 域名
 #   - 按域名把流量转发到对应的内部后端
 #
@@ -1430,15 +1593,15 @@ map $ssl_preread_server_name $backend_name {
     default            main_backend;
 }
 
-# main 主站内部后端：与 conf.d/main.conf 的 listen 端口保持一致
+# main 主站内部后端：与 conf.d/main.conf 的 listen 地址和端口保持一致
 upstream main_backend {
-    server 127.0.0.1:__MAIN_BACKEND_PORT__;
+    server __MAIN_BACKEND_ADDR__:__MAIN_BACKEND_PORT__;
 }
 
 server {
-    # 对外监听 TCP 443，reuseport 提升多 worker 下的分发性能
-    listen 443 reuseport;
-    listen [::]:443 reuseport;
+    # 对外监听 TCP __HTTPS_PORT__，reuseport 提升多 worker 下的分发性能
+    listen __HTTPS_PORT__ reuseport;
+    __STREAM_LISTEN_V6__
 
     # 开启 SNI 预读，在不解密 TLS 的情况下拿到域名
     ssl_preread on;
@@ -1482,11 +1645,17 @@ install_site_templates() {
 # ============================================================
 server {
     listen 127.0.0.1:12001 ssl proxy_protocol;
+    # 如需内部 IPv6 回环，改用：
+    # listen [::1]:12001 ssl proxy_protocol;
+
     http2 on;
 
     server_name ws.example.com;
 
     include /etc/nginx/snippets/ssl.conf;
+
+    # 请求体大小
+    client_max_body_size 50m;
 
     access_log /var/log/nginx/ws_access.log;
     error_log  /var/log/nginx/ws_error.log;
@@ -1502,15 +1671,20 @@ server {
 
         proxy_pass http://127.0.0.1:9001;
 
+        # 长连接超时
+        proxy_connect_timeout 10s;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
-        proxy_buffering off;
     }
 
     # 可选：普通 HTTP 路径
     # location / {
     #     include /etc/nginx/snippets/proxy-common.conf;
     #     proxy_pass http://127.0.0.1:9001;
+    #
+    #     proxy_connect_timeout 10s;
+    #     proxy_read_timeout 60s;
+    #     proxy_send_timeout 60s;
     # }
 
     # 可选：限制连接数
@@ -1536,6 +1710,9 @@ EOF_WS_TEMPLATE
 # ============================================================
 server {
     listen 127.0.0.1:12002 ssl proxy_protocol;
+    # 如需内部 IPv6 回环，改用：
+    # listen [::1]:12002 ssl proxy_protocol;
+
     http2 on;
 
     server_name webdav.example.com;
@@ -1544,6 +1721,12 @@ server {
 
     root /var/www/webdav;
     charset utf-8;
+
+    # 上传大小与超时
+    client_max_body_size    10G;
+    client_body_buffer_size 128k;
+    client_body_timeout     3600s;
+    send_timeout            3600s;
 
     access_log /var/log/nginx/webdav_access.log;
     error_log  /var/log/nginx/webdav_error.log;
@@ -1564,9 +1747,6 @@ server {
 
         create_full_put_path on;
         dav_access user:rw group:r all:r;
-
-        client_max_body_size 10G;
-        client_body_timeout  3600s;
 
         limit_req zone=webdav_read burst=90 nodelay;
         limit_req zone=webdav_write burst=10 nodelay;
@@ -1597,21 +1777,27 @@ EOF_WEBDAV_TEMPLATE
 #     least_conn;
 #     server 127.0.0.1:8080;
 #     server 127.0.0.1:8081;
+#     # server [::1]:8080;
 #     keepalive 32;
 # }
 
 server {
     listen 127.0.0.1:12003 ssl proxy_protocol;
+    # 如需内部 IPv6 回环，改用：
+    # listen [::1]:12003 ssl proxy_protocol;
+
     http2 on;
 
     server_name app.example.com;
 
     include /etc/nginx/snippets/ssl.conf;
 
+    # 请求体大小与请求体缓冲
+    client_max_body_size    50m;
+    client_body_buffer_size 128k;
+
     access_log /var/log/nginx/proxy_access.log;
     error_log  /var/log/nginx/proxy_error.log;
-
-    client_max_body_size 50m;
 
     location = /healthz {
         default_type text/plain;
@@ -1624,11 +1810,23 @@ server {
         # 使用 upstream 时改为：
         # proxy_pass http://app_servers;
 
-        proxy_read_timeout 60s;
-        proxy_send_timeout 60s;
+        # 与上游连接、读写超时
+        proxy_connect_timeout 10s;
+        proxy_read_timeout    60s;
+        proxy_send_timeout    60s;
 
-        # 大文件下载可关闭缓冲
-        # proxy_buffering off;
+        # 上游响应缓冲
+        proxy_buffer_size       16k;
+        proxy_buffers           8 16k;
+        proxy_busy_buffers_size 32k;
+
+        # 普通反向代理保持与上游的长连接
+        # 启用 WebSocket 时由 websocket.conf 提供该指令
+        # proxy_socket_keepalive on;
+
+        # 大文件上传/下载场景按需取消注释
+        # proxy_request_buffering off;
+        # proxy_max_temp_file_size 0;
 
         # 如需 WebSocket，取消以下注释：
         # include /etc/nginx/snippets/websocket.conf;
@@ -1667,6 +1865,16 @@ vim /etc/nginx/conf.d/ws.conf
 
 复制后还需要在 `/etc/nginx/stream.conf.d/stream_sni.conf` 中添加域名与 upstream，
 端口必须与模板中的 `listen` 一致。
+
+内部回环默认使用 `127.0.0.1`；如需 IPv6，将模板中的 `listen` 和
+`stream_sni.conf` 中的 upstream 地址改为 `[::1]`。
+
+模板中的职责划分：
+
+- `snippets/ssl.conf`：证书、私钥、信任链
+- `snippets/proxy-common.conf`：HTTP/1.1、转发头、`proxy_redirect off`
+- `snippets/websocket.conf`：Upgrade/Connection、关闭缓冲、上游长连接，需在 `proxy-common.conf` 之后 include
+- 超时、缓冲区、请求体大小：在各站点模板中独立配置
 
 最后执行：
 ```bash
@@ -1962,6 +2170,14 @@ post_check_and_start() {
 print_next_steps() {
     local http3_info="禁用"
     [[ "${HTTP3_ENABLE}" == "1" ]] && http3_info="启用，UDP/${HTTP3_PORT}"
+    local ipv6_info="禁用"
+    [[ "${IPV6_ENABLE}" == "1" ]] && ipv6_info="启用，双栈监听"
+    local https_suffix=""
+    [[ "${HTTPS_PORT}" != "443" ]] && https_suffix=":${HTTPS_PORT}"
+    local redirect_info="未生成"
+    if [[ "${HTTP_REDIRECT}" == "1" ]]; then
+        redirect_info="${HTTP_REDIRECT_MODE}，${HTTP_REDIRECT_PORT} → ${HTTPS_PORT}"
+    fi
 
     cat <<EOF_NEXT
 
@@ -1973,12 +2189,14 @@ ${C_GREEN}============================================================${C_RESET}
 主站子域名:    ${MAIN_SUBDOMAIN}
 主站配置:      ${NGINX_DIR}/conf.d/main.conf
 主站域名:      ${PRIMARY_DOMAIN}
-80 跳转:       $([[ "${HTTP_REDIRECT}" == "1" ]] && echo "${NGINX_DIR}/conf.d/redirect-http.conf" || echo "未生成")
-Stream 分流:   ${NGINX_DIR}/stream.conf.d/stream_sni.conf
+HTTPS 端口:    ${HTTPS_PORT}
+HTTP 跳转:     ${redirect_info}
+IPv6:          ${ipv6_info}
+Stream 分流:   ${NGINX_DIR}/stream.conf.d/stream_sni.conf (TCP ${HTTPS_PORT})
 场景模板:      ${NGINX_CONF_DIR}/*.conf.example
 模板说明:      ${NGINX_CONF_DIR}/README.md
-统一证书:      ${SSL_CERT_PATH}（未拷贝到 /etc/nginx）
-统一私钥:      ${SSL_KEY_PATH}（未拷贝到 /etc/nginx）
+统一证书:      ${SSL_CERT_PATH}
+统一私钥:      ${SSL_KEY_PATH}
 HTTP/3:        ${http3_info}
 
 常用命令:
@@ -1994,7 +2212,7 @@ HTTP/3:        ${http3_info}
   /etc/nginx/sbin/nginx -t && systemctl reload nginx
 
 访问测试:
-  https://${PRIMARY_DOMAIN}/healthz
+  https://${PRIMARY_DOMAIN}${https_suffix}/healthz
 
 Fail2Ban 模板（未自动安装）:
   /etc/nginx/security/fail2ban/
@@ -2034,9 +2252,9 @@ main() {
     check_os_compat
     install_dependencies
     require_cmds
-    validate_settings
     check_version_currency
     collect_main_inputs
+    validate_settings
     check_http3_port_available
     check_tcp_ports_available
     backup_existing_installation

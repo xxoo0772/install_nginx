@@ -7,7 +7,9 @@
 - 默认交互先询问基础域名，再输入主站子域名；证书路径按模板自动生成
 - 单证书、不拷贝证书
 - 默认只启用 main 主站
-- stream SNI 只监听 443
+- stream SNI 监听 `HTTPS_PORT`（默认 443）
+- 外部监听默认 IPv4/IPv6 双栈
+- HTTP→HTTPS 跳转支持 `main/base/list/all`
 - 场景模板位于 `/etc/nginx/conf.d/*.conf.example`
 - 提供可审计卸载
 
@@ -83,8 +85,23 @@ SSL_KEY_PATH_TPL="/etc/letsencrypt/__BASE_DOMAIN__/__BASE_DOMAIN__.key"
 SSL_CERT_PATH=""
 SSL_KEY_PATH=""
 
+# 对外 HTTPS/TLS 端口与 HTTP 跳转源端口
+HTTPS_PORT="443"
+HTTP_REDIRECT_PORT="80"
+
+# HTTP → HTTPS 跳转
 HTTP_REDIRECT="1"
+HTTP_REDIRECT_MODE="main"        # main / base / list / all
+HTTP_REDIRECT_DOMAINS=""         # list 模式使用，空格分隔
+
+# 内部回环地址与端口
 MAIN_BACKEND_PORT="1111"
+MAIN_BACKEND_ADDR="127.0.0.1"    # IPv6 使用 "[::1]"
+
+# IPv6 双栈监听
+IPV6_ENABLE="1"
+
+# HTTP/3
 HTTP3_ENABLE="0"
 HTTP3_PORT="443"
 OCSP_STAPLING="auto"
@@ -99,7 +116,7 @@ F2B_BANTIME="12h"
 F2B_IGNOREIP="127.0.0.1/8 ::1"
 ```
 
-升级版本时，只改版本号和对应 SHA256 / commit pin。
+版本号与对应 SHA256 / commit pin 集中维护。
 
 ## 4. 部署前准备
 
@@ -107,11 +124,12 @@ F2B_IGNOREIP="127.0.0.1/8 ::1"
 2. 主站子域名已解析，例如 `main.abc.com`
 3. 证书与私钥（建议 fullchain）
 4. 证书 SAN 覆盖主站域名
-5. 防火墙放行：
-   - TCP `443`
-   - TCP `80`（如启用 80 跳转）
-   - UDP `443` 或 `HTTP3_PORT`（仅在启用 HTTP/3 时需要）
+5. 防火墙放行 IPv4 和 IPv6：
+   - TCP `HTTPS_PORT`（默认 443）
+   - TCP `HTTP_REDIRECT_PORT`（如启用 HTTP 跳转，默认 80）
+   - UDP `HTTP3_PORT`（仅在启用 HTTP/3 时需要）
 6. 确认端口未被其他非 Nginx 程序占用
+7. 内部使用 IPv6 回环时，确认 `[::1]` 可用
 
 ## 5. 交互安装
 
@@ -124,13 +142,17 @@ sudo ./install_nginx.sh
 ```text
 请输入基础域名（例如 abc.com）: abc.com
 请输入主站子域名（例如 main，最终为 main.abc.com；输入 @ 使用 abc.com）: main
+请输入对外 HTTPS 端口 [443]: 443
 请输入证书路径（回车使用默认值）: /etc/letsencrypt/abc.com/fullchain.cer
 请输入私钥路径（回车使用默认值）: /etc/letsencrypt/abc.com/abc.com.key
-是否生成 80 → 443 跳转？ [Y/n]
+是否生成 HTTP → HTTPS 跳转？ [Y/n] y
+跳转模式 main/base/list/all [main]: main
+HTTP 跳转源端口 [80]: 80
 ```
 
 - 先输入基础域名，再输入主站子域名，无需输入完整主站域名。
 - 证书路径根据模板自动生成，直接回车即可。
+- 跳转模式为 `list` 时会继续询问域名列表。
 - 交互提示青色，成功绿色，警告黄色，错误红色。
 - `NO_COLOR=1` 可关闭颜色。
 
@@ -142,6 +164,9 @@ sudo ./install_nginx.sh
 NON_INTERACTIVE="1"
 BASE_DOMAIN="abc.com"
 MAIN_SUBDOMAIN="main"
+HTTPS_PORT="443"
+HTTP_REDIRECT_MODE="main"
+IPV6_ENABLE="1"
 # 留空时按模板自动生成证书路径
 SSL_CERT_PATH=""
 SSL_KEY_PATH=""
@@ -230,6 +255,14 @@ nginx -t && systemctl reload nginx
 └── ssl/dhparam.pem
 ```
 
+snippets 职责：
+
+- `ssl.conf`：证书、私钥、信任链
+- `proxy-common.conf`：HTTP/1.1、转发头、`proxy_redirect off`
+- `websocket.conf`：Upgrade/Connection、关闭缓冲、上游长连接，需在 `proxy-common.conf` 之后 include
+
+超时、缓冲区、请求体大小在站点模板中独立配置。
+
 日志：
 
 ```text
@@ -263,9 +296,9 @@ vim /etc/nginx/conf.d/ws.conf
 修改：
 
 1. `server_name`
-2. `listen 127.0.0.1:<端口>`
+2. `listen 127.0.0.1:<端口>`（内部 IPv6 改为 `[::1]`）
 3. `proxy_pass` 或 `root`
-4. 日志、超时、上传大小、限速等
+4. 日志、超时、上传大小、缓冲区、限速等
 
 `.conf.example` 不会被 `conf.d/*.conf` 自动加载。
 
@@ -280,10 +313,12 @@ ws.example.com ws_backend;
 # upstream 区域
 upstream ws_backend {
     server 127.0.0.1:12001;
+    # 内部 IPv6 使用：
+    # server [::1]:12001;
 }
 ```
 
-端口必须与模板中的 `listen` 一致。
+端口必须与模板中的 `listen` 一致。模板内部使用 `[::1]` 时，upstream 也要使用 `[::1]`。
 
 ```bash
 nginx -t && systemctl reload nginx
@@ -297,45 +332,87 @@ HTTP3_ENABLE="0"
 HTTP3_PORT="443"
 ```
 
-- 默认关闭，不监听 UDP，避免与其他服务抢占 UDP/443
+- 默认关闭，不监听 UDP，避免与其他服务抢占 UDP 端口
 - `HTTP3_ENABLE="1"`：启用 QUIC，额外监听 UDP
 - `HTTP3_PORT="8443"`：QUIC 改用 UDP 8443，`Alt-Svc` 自动跟随
 - 安装前检查 UDP 端口占用
-- 其他 QUIC 应用占用 443/udp 时，可关闭 Nginx HTTP/3 或改端口
+- 其他 QUIC 应用占用目标 UDP 端口时，可关闭 Nginx HTTP/3 或改端口
 
-## 12. 80 → 443 跳转
+## 12. HTTP → HTTPS 跳转
 
-默认生成：
+配置：
+
+```bash
+HTTPS_PORT="443"
+HTTP_REDIRECT="1"
+HTTP_REDIRECT_PORT="80"
+HTTP_REDIRECT_MODE="main"
+HTTP_REDIRECT_DOMAINS=""
+```
+
+模式：
+
+| 模式 | server_name | 行为 |
+|---|---|---|
+| `main` | 主站域名 | 仅主站跳转，其他 Host 返回 444 |
+| `base` | 基础域名 + 主站域名 | 两个域名跳转，其他 Host 返回 444 |
+| `list` | `HTTP_REDIRECT_DOMAINS` | 列表内域名跳转，其他 Host 返回 444 |
+| `all` | `_` | 所有 Host 跳转到同名 HTTPS |
+
+以下示例以 `HTTPS_PORT="8443"` 展示端口追加；`HTTPS_PORT="443"` 时目标不带端口。
+
+`main` 模式生成示例：
 
 ```nginx
 server {
     listen 80;
-    listen [::]:80;
-    server_name <主域名>;
-    return 301 https://$host$request_uri;
+    listen [::]:80 ipv6only=on;
+    server_name main.abc.com;
+    return 301 https://main.abc.com:8443$request_uri;
+}
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server ipv6only=on;
+    server_name _;
+    return 444;
 }
 ```
 
-关闭：
+- `HTTPS_PORT` 非 443 时，目标自动追加端口。
+- `HTTP_REDIRECT="0"` 时不生成 `/etc/nginx/conf.d/redirect-http.conf`。
+- `HTTP_REDIRECT_MODE="list"` 时必须填写 `HTTP_REDIRECT_DOMAINS`。
+- `all` 模式使用 `$host`，只在明确接管 HTTP 源端口时使用。
+
+## 13. IPv6
 
 ```bash
-HTTP_REDIRECT="0"
+IPV6_ENABLE="1"
+MAIN_BACKEND_ADDR="127.0.0.1"
 ```
 
-或删除 `/etc/nginx/conf.d/redirect-http.conf` 后 reload。
+- `IPV6_ENABLE="1"`：stream、HTTP 跳转、HTTP/3 同时监听 IPv4 和 IPv6。
+- IPv6 监听显式使用 `ipv6only=on`。
+- 外部 IPv6 客户端默认经 stream 转发到 `MAIN_BACKEND_ADDR` 指定的内部回环地址。
+- 需要内部 IPv6 时，将 `MAIN_BACKEND_ADDR` 改为 `"[::1]"`。
+- 模板中的内部监听可按注释改为 `[::1]`，并同步修改 `stream_sni.conf` 的 upstream。
+- 防火墙需同时放行 IPv4 和 IPv6。
 
-## 13. 验证
+## 14. 验证
 
 ```bash
 sudo /etc/nginx/sbin/nginx -t
 sudo systemctl status nginx --no-pager
 /etc/nginx/sbin/nginx -V 2>&1 | head -5
-curl -kI https://main.abc.com/healthz
-curl --http3 -sI https://main.abc.com/healthz
+curl -kI https://main.abc.com:443/healthz
+curl -kI --resolve main.abc.com:443:127.0.0.1 https://main.abc.com:443/healthz
+curl -6 -kI --resolve main.abc.com:443:[::1] https://main.abc.com:443/healthz
+curl -I http://main.abc.com/
+curl --http3 -sI https://main.abc.com:443/healthz
 sudo ss -lntup | grep nginx
 ```
 
-## 14. 卸载
+## 15. 卸载
 
 ### 交互卸载
 
@@ -398,7 +475,7 @@ curl -fsSL https://raw.githubusercontent.com/<your-org>/<your-repo>/main/install
 
 > 如果脚本中 `NON_INTERACTIVE="1"`，交互卸载需要加 `--interactive`，或使用 `--yes`。
 
-## 15. 备份与回滚
+## 16. 备份与回滚
 
 安装前若已存在 Nginx：
 
@@ -413,9 +490,9 @@ curl -fsSL https://raw.githubusercontent.com/<your-org>/<your-repo>/main/install
 - 安装失败且此前不存在：清理本次产物。
 - 保留现场：`ROLLBACK_ON_ERROR="0"`。
 
-## 16. 常见问题
+## 17. 常见问题
 
-### 16.1 证书 SAN 未覆盖主域名
+### 17.1 证书 SAN 未覆盖主域名
 
 处理：
 
@@ -423,7 +500,7 @@ curl -fsSL https://raw.githubusercontent.com/<your-org>/<your-repo>/main/install
 - 或使用通配符证书；
 - 测试环境可设置 `STRICT_CERT_SAN="0"`。
 
-### 16.2 端口被占用
+### 17.2 端口被占用
 
 ```bash
 sudo ss -lntup | grep -E ':(80|443|1111|8443)\b'
@@ -432,10 +509,10 @@ sudo ss -lntup | grep -E ':(80|443|1111|8443)\b'
 处理：
 
 - 释放端口；
-- 或调整 `MAIN_BACKEND_PORT`；
+- 或调整 `HTTPS_PORT`、`HTTP_REDIRECT_PORT`、`MAIN_BACKEND_PORT`；
 - HTTP/3 可设置 `HTTP3_ENABLE="0"` 或 `HTTP3_PORT="8443"`。
 
-### 16.3 `bind() to 127.0.0.1:1111 failed`
+### 17.3 `bind() to 127.0.0.1:1111 failed`
 
 脚本会在启动前安全停止旧 Nginx，并再次检查端口。
 如仍失败：
@@ -444,14 +521,16 @@ sudo ss -lntup | grep -E ':(80|443|1111|8443)\b'
 sudo ss -lntp 'sport = :1111'
 ```
 
-### 16.4 `ssl_stapling ignored, no OCSP responder URL`
+使用 `MAIN_BACKEND_ADDR="[::1]"` 时，端口检查命令不变，仍为 `sport = :1111`。
+
+### 17.4 `ssl_stapling ignored, no OCSP responder URL`
 
 这是告警，不是启动失败原因。
 
 - 默认 `OCSP_STAPLING="auto"` 会自动关闭；
 - 也可设置 `"off"`。
 
-### 16.5 模板没有被加载
+### 17.5 模板没有被加载
 
 `.conf.example` 不会加载，复制为 `.conf`：
 
@@ -459,7 +538,7 @@ sudo ss -lntp 'sport = :1111'
 cp /etc/nginx/conf.d/ws.conf.example /etc/nginx/conf.d/ws.conf
 ```
 
-### 16.6 新增站点后 SNI 不生效
+### 17.6 新增站点后 SNI 不生效
 
 检查 `/etc/nginx/stream.conf.d/stream_sni.conf`：
 
@@ -467,27 +546,20 @@ cp /etc/nginx/conf.d/ws.conf.example /etc/nginx/conf.d/ws.conf
 - upstream 端口是否与模板 `listen` 一致
 - 是否执行 `nginx -t && systemctl reload nginx`
 
-### 16.7 没有 journald 日志
+### 17.7 没有 journald 日志
 
 Debian 13 最小化系统可能没有 `/dev/log`，脚本会自动跳过 syslog 通道，仅保留文件日志。
 
-## 17. 升级与校验
+## 18. 校验
 
-### 17.1 升级版本
-
-1. 编辑脚本顶部版本号；
-2. 同步更新对应 SHA256 / commit pin；
-3. 在测试环境重新安装验证；
-4. 确认 `nginx -V` 输出目标版本与 `built with OpenSSL 3.5.x`。
-
-### 17.2 静态校验
+### 18.1 静态校验
 
 ```bash
 bash -n install_nginx.sh
 shellcheck -S warning install_nginx.sh
 ```
 
-### 17.3 运行期校验
+### 18.2 运行期校验
 
 ```bash
 sudo /etc/nginx/sbin/nginx -t
