@@ -7,7 +7,7 @@
 - 无 env 文件
 - 配置、版本、SHA256、模板全部在脚本内
 - 默认交互安装
-- 单证书、不拷贝证书
+- 单证书
 - 默认只启用 main 主站
 - 保留 stream SNI
 - 支持 IPv4/IPv6 双栈
@@ -34,11 +34,13 @@
   ├─ TCP HTTPS_PORT → stream（ssl_preread + PROXY protocol）
   │     ├─ 主域名 → MAIN_BACKEND_ADDR:1111（main）
   │     └─ default → MAIN_BACKEND_ADDR:1111（main）
-  ├─ UDP HTTP3_PORT → HTTP/3（QUIC，可关闭或改端口）
+  ├─ UDP HTTP3_PORT → HTTP/3（QUIC，Nginx 完成 TLS 握手/解密，可关闭或改端口）
   └─ TCP HTTP_REDIRECT_PORT → 301 到 HTTPS（可关闭）
 ```
 
 - 默认只启用 `main` 主站。
+- `stream` 层只读取 SNI 并转发，不解密 TLS；TLS 在 `main` 站点完成。
+- HTTP/3 由 Nginx 作为 TLS 端点完成握手与解密，不是中断客户端访问。
 - 其他场景通过 `/etc/nginx/conf.d/*.conf.example` 模板提供。
 - 模板复制为 `.conf` 后，需要在 `stream_sni.conf` 中增加 map/upstream。
 - 外部监听默认同时生成 IPv4 和 IPv6。
@@ -47,7 +49,7 @@
 ## 4. 证书模型
 
 - 证书/私钥路径支持模板，按基础域名自动替换，安装时可回车采用默认值。
-- 不拷贝证书，不修改证书权限。
+- 证书直接引用原始路径，不修改证书权限。
 - 生成 `/etc/nginx/snippets/ssl.conf`，所有站点和模板统一 include。
 - 校验证书可读、未过期、与私钥匹配、SAN 覆盖主域名。
 - `OCSP_STAPLING="auto"` 时按证书是否含 OCSP URL 自动启停 stapling。

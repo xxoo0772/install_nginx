@@ -3,7 +3,7 @@
 #====================================================
 # 企业级 Nginx 源码编译部署脚本
 # - 单文件、无 env 依赖
-# - 单证书、不拷贝证书；证书路径支持按域名模板自动替换
+# - 单证书；证书路径支持按域名模板自动替换
 # - stream SNI 监听 TCP HTTPS_PORT（默认 443），默认只启用 main 主站
 # - HTTP/3 默认关闭，避免与其他服务抢占 UDP 端口
 # - HTTP→HTTPS 跳转支持 main/base/list/all 模式
@@ -185,6 +185,7 @@ C_YELLOW=""
 C_RED=""
 STEP_TOTAL=17
 STEP_CURRENT=0
+READLINE_SUPPORTED=""
 
 setup_ui() {
     if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -206,12 +207,33 @@ ui_step()  {
     printf "%b[%d/%d]%b %s\n" "$C_CYAN" "$STEP_CURRENT" "$STEP_TOTAL" "$C_RESET" "$*"
 }
 
+detect_readline_support() {
+    [[ -n "${READLINE_SUPPORTED}" ]] && return 0
+    local dummy=""
+    local rc=0
+    IFS= read -r -e -t 0 dummy </dev/null 2>/dev/null || rc=$?
+    if [[ "${rc}" == "0" || "${rc}" == "1" ]]; then
+        READLINE_SUPPORTED=1
+    else
+        READLINE_SUPPORTED=0
+    fi
+}
+
 read_input() {
     local var="$1"
-    if [[ -r /dev/tty ]]; then
-        IFS= read -r "$var" </dev/tty || true
+    detect_readline_support
+    if [[ "${READLINE_SUPPORTED}" == "1" ]]; then
+        if [[ -r /dev/tty ]]; then
+            IFS= read -r -e "$var" </dev/tty || true
+        else
+            IFS= read -r -e "$var" || true
+        fi
     else
-        IFS= read -r "$var" || true
+        if [[ -r /dev/tty ]]; then
+            IFS= read -r "$var" </dev/tty || true
+        else
+            IFS= read -r "$var" || true
+        fi
     fi
 }
 
@@ -243,10 +265,70 @@ prompt_yes_no() {
     local hint="[Y/n]"
     local answer=""
     [[ "${default}" =~ ^[Nn] ]] && hint="[y/N]"
-    printf "%b%s%b %b%s%b " "$C_CYAN" "$label" "$C_RESET" "$C_GREEN" "$hint" "$C_RESET" >&2
-    read_input answer
-    answer="${answer:-${default}}"
-    [[ "${answer}" =~ ^[Yy]([Ee][Ss])?$ ]]
+    while true; do
+        printf "%b%s%b %b%s%b " "$C_CYAN" "$label" "$C_RESET" "$C_GREEN" "$hint" "$C_RESET" >&2
+        read_input answer
+        answer="${answer:-${default}}"
+        if [[ "${answer}" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+            return 0
+        fi
+        if [[ "${answer}" =~ ^[Nn][Oo]?$ ]]; then
+            return 1
+        fi
+        printf "%b请输入 Y 或 N%b\n" "$C_YELLOW" "$C_RESET" >&2
+    done
+}
+
+prompt_choice() {
+    local label="$1"
+    local default="$2"
+    shift 2
+    local -a choices=("$@")
+    local i answer default_index=1
+
+    for i in "${!choices[@]}"; do
+        if [[ "${choices[$i]}" == "${default}" ]]; then
+            default_index=$((i + 1))
+        fi
+    done
+
+    {
+        printf "%b%s%b\n" "$C_CYAN" "$label" "$C_RESET"
+        for i in "${!choices[@]}"; do
+            printf "  %b%d)%b %s\n" "$C_GREEN" "$((i + 1))" "$C_RESET" "${choices[$i]}"
+        done
+    } >&2
+
+    while true; do
+        printf "%b请输入编号%b [%b%d%b]: " "$C_CYAN" "$C_RESET" "$C_GREEN" "${default_index}" "$C_RESET" >&2
+        read_input answer
+        answer="${answer:-${default_index}}"
+        if [[ "${answer}" =~ ^[0-9]+$ ]] && (( 10#${answer} >= 1 && 10#${answer} <= ${#choices[@]} )); then
+            printf '%s' "${choices[$((answer - 1))]}"
+            return 0
+        fi
+        for i in "${choices[@]}"; do
+            if [[ "${answer}" == "${i}" ]]; then
+                printf '%s' "${answer}"
+                return 0
+            fi
+        done
+        printf "%b无效选择，请输入 1-%d 或模式名称%b\n" "$C_YELLOW" "${#choices[@]}" "$C_RESET" >&2
+    done
+}
+
+prompt_port() {
+    local label="$1"
+    local default="$2"
+    local value=""
+    while true; do
+        value="$(prompt_value "${label}" "${default}")"
+        if [[ "${value}" =~ ^[0-9]+$ ]] && (( 10#${value} >= 1 && 10#${value} <= 65535 )); then
+            printf '%s' "${value}"
+            return 0
+        fi
+        printf "%b端口必须是 1-65535 的整数%b\n" "$C_YELLOW" "$C_RESET" >&2
+    done
 }
 
 on_error() {
@@ -733,8 +815,7 @@ collect_main_inputs() {
 
     # 3) 对外 HTTPS 端口
     if [[ "${NON_INTERACTIVE}" != "1" ]]; then
-        value="$(prompt_value "请输入对外 HTTPS 端口" "${HTTPS_PORT}")"
-        HTTPS_PORT="${value:-${HTTPS_PORT}}"
+        HTTPS_PORT="$(prompt_port "请输入对外 HTTPS 端口" "${HTTPS_PORT}")"
     fi
 
     # 4) 证书路径：优先使用脚本顶部模板自动生成，用户可直接回车采用默认值
@@ -805,14 +886,30 @@ collect_main_inputs() {
         [[ "${HTTP_REDIRECT}" == "1" ]] && default="Y"
         if prompt_yes_no "是否生成 HTTP → HTTPS 跳转？" "${default}"; then
             HTTP_REDIRECT=1
-            value="$(prompt_value "跳转模式 main/base/list/all" "${HTTP_REDIRECT_MODE}")"
-            HTTP_REDIRECT_MODE="${value:-${HTTP_REDIRECT_MODE}}"
+            HTTP_REDIRECT_MODE="$(prompt_choice "请选择 HTTP → HTTPS 跳转模式（main 仅主站 / base 根域+主站 / list 指定域名 / all 全部）" "${HTTP_REDIRECT_MODE}" main base list all)"
             if [[ "${HTTP_REDIRECT_MODE}" == "list" ]]; then
-                value="$(prompt_value "跳转域名列表（空格分隔）" "${HTTP_REDIRECT_DOMAINS}")"
-                HTTP_REDIRECT_DOMAINS="${value:-${HTTP_REDIRECT_DOMAINS}}"
+                while true; do
+                    HTTP_REDIRECT_DOMAINS="$(prompt_value "跳转域名列表（空格分隔）" "${HTTP_REDIRECT_DOMAINS}")"
+                    if [[ -z "${HTTP_REDIRECT_DOMAINS}" ]]; then
+                        ui_warn "list 模式必须填写至少一个域名"
+                        continue
+                    fi
+                    local -a redirect_domain_list=()
+                    local domain=""
+                    local has_invalid=0
+                    read -r -a redirect_domain_list <<< "${HTTP_REDIRECT_DOMAINS}"
+                    for domain in "${redirect_domain_list[@]}"; do
+                        if [[ ! "${domain}" =~ ^[A-Za-z0-9.-]+$ ]]; then
+                            ui_warn "域名格式不合法: ${domain}"
+                            has_invalid=1
+                        fi
+                    done
+                    if (( has_invalid == 0 )); then
+                        break
+                    fi
+                done
             fi
-            value="$(prompt_value "HTTP 跳转源端口" "${HTTP_REDIRECT_PORT}")"
-            HTTP_REDIRECT_PORT="${value:-${HTTP_REDIRECT_PORT}}"
+            HTTP_REDIRECT_PORT="$(prompt_port "HTTP 跳转源端口" "${HTTP_REDIRECT_PORT}")"
         else
             HTTP_REDIRECT=0
         fi
@@ -1337,7 +1434,7 @@ write_snippets() {
 # 统一证书配置（由 install_nginx.sh 自动生成）
 #
 # 说明：
-#   - 证书不会拷贝到 /etc/nginx，直接引用安装时指定的原始路径
+#   - 证书直接引用安装时指定的原始路径
 #   - 所有站点、模板统一通过 include 本文件复用同一张证书
 #   - 证书续期后只需 systemctl reload nginx，无需改动站点配置
 # ============================================================
@@ -1419,12 +1516,13 @@ write_main_site() {
 server {
     # ---------- 内部监听 ----------
     # 仅绑定本机回环地址，端口由脚本 MAIN_BACKEND_PORT 决定
-    # ssl：在此层完成 TLS 终止
+    # ssl：TLS 握手与解密在此层完成，Nginx 是 TLS 端点；客户端连接不会被中断
     # proxy_protocol：接收 stream 层传来的真实客户端 IP
     listen __MAIN_BACKEND_ADDR__:__MAIN_BACKEND_PORT__ ssl proxy_protocol;
 
     # ---------- HTTP/3 / QUIC 监听 ----------
     # 由脚本顶部 HTTP3_ENABLE 控制；开启后会额外监听 UDP 端口
+    # HTTP/3 的 TLS 握手同样在 Nginx 完成，并非中断客户端访问
     __HTTP3_COMMENT_LINE__
     __HTTP3_LISTEN_V4__
     __HTTP3_LISTEN_V6__
@@ -1441,7 +1539,7 @@ server {
     # 主站域名由「主站子域名 + 基础域名」自动拼接
     server_name __PRIMARY_DOMAIN__;
 
-    # 统一证书配置（证书不会拷贝到 /etc/nginx）
+    # 统一证书配置
     include /etc/nginx/snippets/ssl.conf;
 
     # ---------- 站点根目录 ----------
@@ -1881,7 +1979,7 @@ vim /etc/nginx/conf.d/ws.conf
 nginx -t && systemctl reload nginx
 ```
 
-所有模板统一引用 `/etc/nginx/snippets/ssl.conf`，证书来自安装时指定的路径，不会拷贝。
+所有模板统一引用 `/etc/nginx/snippets/ssl.conf`，证书直接使用安装时指定的路径。
 EOF_TEMPLATES_README
     chmod 644 "${NGINX_CONF_DIR}/README.md"
 
@@ -1936,7 +2034,7 @@ confirm_uninstall_or_exit() {
     ui_warn "5) /usr/local/src 下的源码与压缩包"
     ui_warn "6) jemalloc 安装产物"
     ui_warn "7) Fail2Ban 模板/规则（若存在）"
-    ui_warn "证书文件不会被删除（安装时未拷贝证书）"
+    ui_warn "证书文件保持原位，不会被删除"
 
     if [[ "${FORCE_UNINSTALL}" == "1" ]]; then
         ui_warn "已启用强制卸载，跳过人工确认"

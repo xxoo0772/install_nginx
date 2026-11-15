@@ -5,7 +5,7 @@
 - 所有配置在脚本顶部
 - 组件版本与 SHA256 为显式变量
 - 默认交互先询问基础域名，再输入主站子域名；证书路径按模板自动生成
-- 单证书、不拷贝证书
+- 单证书
 - 默认只启用 main 主站
 - stream SNI 监听 `HTTPS_PORT`（默认 443）
 - 外部监听默认 IPv4/IPv6 双栈
@@ -146,7 +146,12 @@ sudo ./install_nginx.sh
 请输入证书路径（回车使用默认值）: /etc/letsencrypt/abc.com/fullchain.cer
 请输入私钥路径（回车使用默认值）: /etc/letsencrypt/abc.com/abc.com.key
 是否生成 HTTP → HTTPS 跳转？ [Y/n] y
-跳转模式 main/base/list/all [main]: main
+请选择 HTTP → HTTPS 跳转模式（main 仅主站 / base 根域+主站 / list 指定域名 / all 全部）
+  1) main
+  2) base
+  3) list
+  4) all
+请输入编号 [1]: 1
 HTTP 跳转源端口 [80]: 80
 ```
 
@@ -190,7 +195,7 @@ sudo ./install_nginx.sh --non-interactive
 
 ## 7. 证书说明
 
-安装时只使用一张证书，不拷贝证书。
+安装时只使用一张证书，并直接引用其原始路径。
 
 证书路径支持模板替换：
 
@@ -333,7 +338,7 @@ HTTP3_PORT="443"
 ```
 
 - 默认关闭，不监听 UDP，避免与其他服务抢占 UDP 端口
-- `HTTP3_ENABLE="1"`：启用 QUIC，额外监听 UDP
+- `HTTP3_ENABLE="1"`：启用 QUIC，额外监听 UDP；TLS 握手与解密由 Nginx 直接完成（Nginx 是 TLS 端点，客户端访问不会被中断）
 - `HTTP3_PORT="8443"`：QUIC 改用 UDP 8443，`Alt-Svc` 自动跟随
 - 安装前检查 UDP 端口占用
 - 其他 QUIC 应用占用目标 UDP 端口时，可关闭 Nginx HTTP/3 或改端口
